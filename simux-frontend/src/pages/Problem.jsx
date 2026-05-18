@@ -449,6 +449,8 @@ export default function Problem() {
         { headers: { Authorization: `Bearer ${token}` } },
       );
       const { stdout, stderr, time_ms, exit_code } = res.data;
+
+      
       const lines = [];
       if (stdout)
         stdout

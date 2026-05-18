@@ -625,12 +625,12 @@ app.post('/run', requireAuth, async (req, res) => {
 
         const tcs = await pool.query(
             `SELECT
-                input,
-                expected_output,
-                is_sample
-             FROM test_cases
-             WHERE problem_id = $1
-             ORDER BY id ASC`,
+  input,
+  expected_output,
+  is_sample
+FROM test_cases
+WHERE problem_id = $1
+ORDER BY id ASC`,
             [prob.rows[0].id]
         );
 
