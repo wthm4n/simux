@@ -75,163 +75,133 @@ function ConsoleLine({ line }) {
 }
 
 // ── Test case tile ────────────────────────────────────────────────────────────
-function TCTile({ tc, idx, result }) {
-  const [open, setOpen] = useState(false);
-
-  // result: { passed: bool, time_ms: num } | null | 'hidden'
+function TCTile({ tc, idx, result, running }) {
   const isHidden = !tc.is_sample;
+
   const status =
     result === null
-      ? "pending"
-      : result === "hidden"
-        ? "hidden"
-        : result?.passed
-          ? "pass"
-          : result?.verdict === "TLE"
-            ? "tle"
-            : result?.verdict === "RE"
-              ? "re"
-              : "fail";
+      ? running
+        ? "running"
+        : "pending"
+      : result?.passed
+        ? "pass"
+        : result?.verdict === "TLE"
+          ? "tle"
+          : result?.verdict === "RE"
+            ? "re"
+            : "fail";
 
-  const statusConfig = {
+  const styles = {
     pending: {
       dot: "bg-gray-700",
-      ring: "border-gray-800",
-      icon: null,
-      label: "—",
+      border: "border-[#1a1a1a]",
+      text: "text-gray-500",
+      label: "Pending",
     },
+
+    running: {
+      dot: "bg-yellow-500 animate-pulse",
+      border: "border-yellow-900/40",
+      text: "text-yellow-400",
+      label: "Running",
+    },
+
     pass: {
       dot: "bg-emerald-500",
-      ring: "border-emerald-800",
-      icon: "✓",
-      label: "Pass",
+      border: "border-emerald-900/40",
+      text: "text-emerald-400",
+      label: "Passed",
     },
+
     fail: {
       dot: "bg-red-500",
-      ring: "border-red-900",
-      icon: "✗",
-      label: "Fail",
+      border: "border-red-900/40",
+      text: "text-red-400",
+      label: "Wrong",
     },
+
     tle: {
       dot: "bg-amber-500",
-      ring: "border-amber-900",
-      icon: "⏱",
+      border: "border-amber-900/40",
+      text: "text-amber-400",
       label: "TLE",
     },
+
     re: {
       dot: "bg-orange-500",
-      ring: "border-orange-900",
-      icon: "!",
+      border: "border-orange-900/40",
+      text: "text-orange-400",
       label: "RE",
-    },
-    hidden: {
-      dot: "bg-gray-600",
-      ring: "border-gray-800",
-      icon: null,
-      label: "?",
     },
   };
 
-  const cfg = statusConfig[status];
+  const cfg = styles[status];
 
   return (
-    <div>
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className={`w-full text-left rounded-lg border px-3 py-2.5 flex items-center gap-2.5 transition-all hover:bg-white/3 ${cfg.ring} bg-[#0a0a0a]`}
-      >
-        <span className={`w-2 h-2 rounded-full flex-shrink-0 ${cfg.dot}`} />
-        <span className="text-xs text-gray-400 font-mono flex-1">
-          Case {idx + 1}
+    <div
+      className={`rounded-xl border bg-[#0b0b0b] p-3 transition-all hover:bg-[#101010] ${cfg.border}`}
+    >
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <span className={`w-2 h-2 rounded-full ${cfg.dot}`} />
+
+          <span className="text-xs font-mono text-gray-300">
+            Case {idx + 1}
+          </span>
+
           {isHidden && (
-            <span className="ml-1.5 text-[10px] text-gray-600 uppercase tracking-wider">
+            <span className="text-[9px] uppercase tracking-widest text-gray-600">
               hidden
             </span>
           )}
-        </span>
-        {result?.time_ms > 0 && (
-          <span className="text-[10px] text-gray-600 font-mono">
-            {result.time_ms}ms
-          </span>
-        )}
-        <span
-          className={`text-xs font-bold font-mono ${
-            status === "pass"
-              ? "text-emerald-400"
-              : status === "fail"
-                ? "text-red-400"
-                : status === "tle"
-                  ? "text-amber-400"
-                  : status === "re"
-                    ? "text-orange-400"
-                    : "text-gray-600"
-          }`}
-        >
-          {cfg.icon || cfg.label}
-        </span>
-        <svg
-          className={`w-3 h-3 text-gray-700 transition-transform flex-shrink-0 ${open ? "rotate-180" : ""}`}
-          viewBox="0 0 12 12"
-          fill="none"
-        >
-          <path
-            d="M2 4l4 4 4-4"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
-      </button>
+        </div>
 
-      {open && (
-        <div className="mt-1 rounded-lg border border-[#1a1a1a] overflow-hidden bg-[#080808]">
-          {isHidden && status === "hidden" ? (
-            <div className="px-4 py-3 text-xs text-gray-600 italic font-mono">
-              Hidden test case — not visible
+        <span className={`text-[10px] font-mono ${cfg.text}`}>{cfg.label}</span>
+      </div>
+
+      {!isHidden ? (
+        <div className="space-y-3">
+          <div>
+            <div className="text-[9px] uppercase tracking-widest text-gray-600 mb-1">
+              Input
             </div>
-          ) : (
-            <div className="grid grid-cols-2 divide-x divide-[#1a1a1a]">
-              <div className="p-3">
-                <div className="text-[9px] uppercase tracking-widest text-gray-600 mb-1.5 font-bold">
-                  Input
-                </div>
-                <pre className="text-xs text-gray-300 font-mono whitespace-pre-wrap break-all">
-                  {isHidden ? (
-                    <span className="text-gray-700 italic">hidden</span>
-                  ) : (
-                    tc.input || (
-                      <span className="text-gray-700 italic">empty</span>
-                    )
-                  )}
-                </pre>
+
+            <pre className="text-xs font-mono text-gray-300 whitespace-pre-wrap break-all bg-[#080808] rounded p-2 border border-[#151515]">
+              {tc.input}
+            </pre>
+          </div>
+
+          <div>
+            <div className="text-[9px] uppercase tracking-widest text-gray-600 mb-1">
+              Expected
+            </div>
+
+            <pre className="text-xs font-mono text-gray-300 whitespace-pre-wrap break-all bg-[#080808] rounded p-2 border border-[#151515]">
+              {tc.expected_output}
+            </pre>
+          </div>
+
+          {result?.actual_output && !result?.passed && (
+            <div>
+              <div className="text-[9px] uppercase tracking-widest text-red-700 mb-1">
+                Got
               </div>
-              <div className="p-3">
-                <div className="text-[9px] uppercase tracking-widest text-gray-600 mb-1.5 font-bold">
-                  Expected
-                </div>
-                <pre className="text-xs text-gray-300 font-mono whitespace-pre-wrap break-all">
-                  {isHidden ? (
-                    <span className="text-gray-700 italic">hidden</span>
-                  ) : (
-                    tc.expected_output || (
-                      <span className="text-gray-700 italic">empty</span>
-                    )
-                  )}
-                </pre>
-                {result?.actual_output && status !== "pass" && (
-                  <>
-                    <div className="text-[9px] uppercase tracking-widest text-red-700 mt-2 mb-1.5 font-bold">
-                      Got
-                    </div>
-                    <pre className="text-xs text-red-400 font-mono whitespace-pre-wrap break-all">
-                      {result.actual_output}
-                    </pre>
-                  </>
-                )}
-              </div>
+
+              <pre className="text-xs font-mono text-red-400 whitespace-pre-wrap break-all bg-[#080808] rounded p-2 border border-red-900/30">
+                {result.actual_output}
+              </pre>
             </div>
           )}
+        </div>
+      ) : (
+        <div className="h-[88px] flex items-center justify-center rounded-lg border border-dashed border-[#1a1a1a] text-[11px] text-gray-700 font-mono">
+          Hidden testcase
+        </div>
+      )}
+
+      {result?.time_ms > 0 && (
+        <div className="mt-3 text-[10px] text-gray-600 font-mono">
+          {result.time_ms}ms
         </div>
       )}
     </div>
@@ -352,16 +322,23 @@ function BottomPanel({
       {/* Test cases tab */}
       {tab === "tests" && (
         <div className="flex-1 overflow-y-auto p-3">
-  <div className="grid grid-cols-3 gap-3">
-          {testCases.length === 0 ? (
-            <p className="text-xs text-gray-700 font-mono italic">
-              Submit to see test results...
-            </p>
-          ) : (
-            testCases.map((tc, i) => (
-              <TCTile key={i} idx={i} tc={tc} result={tcResults[i] ?? null} />
-            ))
-          )}
+          <div className="grid grid-cols-3 gap-3">
+            {testCases.length === 0 ? (
+              <p className="text-xs text-gray-700 font-mono italic">
+                Submit to see test results...
+              </p>
+            ) : (
+              testCases.map((tc, i) => (
+                <TCTile
+                  key={i}
+                  idx={i}
+                  tc={tc}
+                  result={tcResults[i] ?? null}
+                  running={running || submitting}
+                />
+              ))
+            )}
+          </div>
         </div>
       )}
     </div>
