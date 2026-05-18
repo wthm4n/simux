@@ -1274,7 +1274,7 @@ export default function AdminPanel() {
                   <p className="text-[10px] uppercase tracking-widest text-gray-600 mt-1">{label}</p>
                 </div>
               ))}
-            </div>
+            </div> 
 
             {/* Live preview */}
             <Card>
