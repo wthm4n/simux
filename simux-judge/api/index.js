@@ -397,7 +397,8 @@ app.get('/problems/:slug', async (req, res) => {
 
         res.json({
             ...prob.rows[0],
-            sample_cases: samples.rows
+            sample_cases: samples.rows.filter(tc => tc.is_sample),
+test_cases: samples.rows
         });
 
     } catch (err) {

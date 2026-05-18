@@ -451,15 +451,15 @@ export default function Problem() {
       const { stdout, stderr, time_ms, exit_code } = res.data;
 
       if (res.data.results) {
-  setTcResults(
-    res.data.results.map((r) => ({
-      passed: r.passed,
-      time_ms: r.time_ms,
-      verdict: r.verdict,
-      actual_output: r.actual_output,
-    })),
-  );
-}
+        setTcResults(
+          res.data.results.map((r) => ({
+            passed: r.passed,
+            time_ms: r.time_ms,
+            verdict: r.verdict,
+            actual_output: r.actual_output,
+          })),
+        );
+      }
 
       const lines = [];
       if (stdout)
