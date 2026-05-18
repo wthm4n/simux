@@ -604,9 +604,36 @@ app.post('/submit', requireAuth, async (req, res) => {
 // RUN CODE
 // ─────────────────────────────────────────────────────────────
 app.post('/run', requireAuth, async (req, res) => {
-    const { language, code, stdin } = req.body;
+    const {
+        problem_slug,
+        language,
+        code
+    } = req.body;
 
     try {
+        const prob = await pool.query(
+            `SELECT id
+             FROM problems
+             WHERE slug = $1`,
+            [problem_slug]
+        );
+
+        if (prob.rows.length === 0)
+            return res.status(404).json({
+                error: 'problem not found'
+            });
+
+        const tcs = await pool.query(
+            `SELECT
+                input,
+                expected_output,
+                is_sample
+             FROM test_cases
+             WHERE problem_id = $1
+             ORDER BY id ASC`,
+            [prob.rows[0].id]
+        );
+
         const response = await fetch(
             'http://localhost:5050/execute',
             {
@@ -617,7 +644,7 @@ app.post('/run', requireAuth, async (req, res) => {
                 body: JSON.stringify({
                     language,
                     code,
-                    stdin
+                    test_cases: tcs.rows
                 })
             }
         );
