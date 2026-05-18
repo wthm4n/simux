@@ -388,13 +388,10 @@ app.get('/problems/:slug', async (req, res) => {
             });
 
         const samples = await pool.query(
-            `SELECT
-  input,
-  expected_output,
-  is_sample
-FROM test_cases
-WHERE problem_id = $1
-ORDER BY id ASC`,
+            `SELECT input, expected_output
+             FROM test_cases
+             WHERE problem_id = $1
+             AND is_sample = TRUE`,
             [prob.rows[0].id]
         );
 
