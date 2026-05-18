@@ -603,102 +603,34 @@ app.post('/submit', requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // RUN CODE
 // ─────────────────────────────────────────────────────────────
-
 app.post('/run', requireAuth, async (req, res) => {
-    const {
-        problem_slug,
-        language,
-        code
-    } = req.body;
-
-    if (!problem_slug || !language || !code)
-        return res.status(400).json({
-            error: 'problem_slug, language, code required'
-        });
+    const { language, code, stdin } = req.body;
 
     try {
-        const prob = await pool.query(
-            `SELECT id
-             FROM problems
-             WHERE slug = $1`,
-            [problem_slug]
-        );
-
-        if (prob.rows.length === 0)
-            return res.status(404).json({
-                error: 'problem not found'
-            });
-
-        const problem_id = prob.rows[0].id;
-
-        // get first sample testcase
-        const tc = await pool.query(
-            `SELECT input
-             FROM test_cases
-             WHERE problem_id = $1
-             AND is_sample = TRUE
-             ORDER BY id ASC
-             LIMIT 1`,
-            [problem_id]
-        );
-
-        const input = tc.rows[0]?.input || '';
-
-        // temp submission id
-        const id = uuidv4();
-
-        await pool.query(
-            `INSERT INTO submissions
-             (id, language, code, status, problem_id, user_id)
-             VALUES ($1, $2, $3, 'running', $4, $5)`,
-            [
-                id,
-                language,
-                code,
-                problem_id,
-                req.user.id
-            ]
-        );
-
-        const ch = await getChannel();
-
-        ch.sendToQueue(
-            'submissions',
-            Buffer.from(JSON.stringify({
-                id,
-                language,
-                code,
-                test_cases: [
-                    {
-                        input,
-                        expected_output: ''
-                    }
-                ],
-                run_only: true
-            })),
+        const response = await fetch(
+            'http://localhost:5050/execute',
             {
-                persistent: true
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    language,
+                    code,
+                    stdin
+                })
             }
         );
 
-        log(
-            'ok',
-            `Run queued → ${color(id.slice(0, 8), C.brightCyan)}`
-        );
+        const data = await response.json();
 
-        // quick fake response for frontend
-        res.json({
-            stdout: 'Execution queued...',
-            stderr: '',
-            time_ms: 0,
-            exit_code: 0
-        });
+        res.json(data);
 
     } catch (err) {
         console.error(err);
 
         res.status(500).json({
-            error: 'run failed'
+            error: 'execution failed'
         });
     }
 });

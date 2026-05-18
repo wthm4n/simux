@@ -323,14 +323,13 @@ export default function Problem() {
     try {
       // POST to /run — expects { stdout, stderr, time_ms, exit_code }
       const res = await axios.post(
-        `${API}/run`,
-        {
-          problem_slug: slug,
-          language,
-          code: currentCode,
-        },
-        { headers: { Authorization: `Bearer ${token}` } }
-      )
+  `${API}/run`,
+  {
+    problem_slug: slug,
+    language,
+    code: currentCode,
+    stdin: problem.sample_cases?.[0]?.input || ''
+  },
       const { stdout, stderr, time_ms, exit_code } = res.data
       const lines = []
       if (stdout) stdout.split('\n').forEach(l => lines.push({ type: 'stdout', text: l }))
