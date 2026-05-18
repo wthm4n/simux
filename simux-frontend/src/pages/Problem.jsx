@@ -351,7 +351,8 @@ function BottomPanel({
 
       {/* Test cases tab */}
       {tab === "tests" && (
-        <div className="flex-1 overflow-y-auto px-3 py-3 space-y-1.5">
+        <div className="flex-1 overflow-y-auto p-3">
+  <div className="grid grid-cols-3 gap-3">
           {testCases.length === 0 ? (
             <p className="text-xs text-gray-700 font-mono italic">
               Submit to see test results...
