@@ -746,13 +746,58 @@ def execute():
     data = request.json
 
     try:
-        result = execute_run(
-            data["language"],
-            data["code"],
-            data.get("stdin", "")
-        )
+        language = data["language"]
+        code = data["code"]
+        test_cases = data.get("test_cases", [])
 
-        return jsonify(result)
+        results = []
+        all_passed = True
+        total_time = 0
+
+        for tc in test_cases:
+            result = run_in_docker(
+                language,
+                code,
+                tc["input"]
+            )
+
+            actual = result["stdout"].strip()
+            expected = tc["expected_output"].strip()
+
+            passed = actual == expected
+
+            if not passed:
+                all_passed = False
+
+            total_time += result["time_ms"]
+
+            verdict = (
+                "RE"
+                if result["error"] == "runtime_error"
+                else "TLE"
+                if result.get("tle")
+                else "WA"
+                if not passed
+                else "AC"
+            )
+
+            results.append({
+                "passed": passed,
+                "verdict": verdict,
+                "time_ms": result["time_ms"],
+                "actual_output": actual,
+                "expected_output": expected,
+                "input": tc["input"]
+            })
+
+        return jsonify({
+            "stdout": results[0]["actual_output"] if results else "",
+            "stderr": "",
+            "time_ms": total_time,
+            "exit_code": 0,
+            "results": results,
+            "verdict": "AC" if all_passed else "WA"
+        })
 
     except Exception as e:
         return jsonify({
