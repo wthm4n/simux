@@ -387,18 +387,25 @@ app.get('/problems/:slug', async (req, res) => {
                 error: 'problem not found'
             });
 
-        const samples = await pool.query(
-            `SELECT input, expected_output
+        const cases = await pool.query(
+            `SELECT
+                input,
+                expected_output,
+                is_sample
              FROM test_cases
              WHERE problem_id = $1
-             AND is_sample = TRUE`,
+             ORDER BY id ASC`,
             [prob.rows[0].id]
         );
 
         res.json({
             ...prob.rows[0],
-            sample_cases: samples.rows.filter(tc => tc.is_sample),
-            test_cases: samples.rows
+
+            // public visible cases
+            sample_cases: cases.rows.filter(tc => tc.is_sample),
+
+            // ALL cases including hidden
+            test_cases: cases.rows
         });
 
     } catch (err) {
@@ -626,9 +633,9 @@ app.post('/run', requireAuth, async (req, res) => {
 
         const tcs = await pool.query(
             `SELECT
-  input,
-  expected_output,
-  is_sample
+    input,
+    expected_output,
+    is_sample
 FROM test_cases
 WHERE problem_id = $1
 ORDER BY id ASC`,

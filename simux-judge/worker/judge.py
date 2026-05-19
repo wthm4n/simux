@@ -312,7 +312,7 @@ def _summary_row(submission_id, language, verdict_code, passed, total, time_ms):
 
 def get_db():
     return psycopg2.connect(
-        host="host.docker.internal",
+        host="localhost",
         database="judgedb",
         user="judge",
         password="judge123",
@@ -834,7 +834,7 @@ def start_worker():
     _log("info", "Connecting to RabbitMQ…")
     connection = pika.BlockingConnection(
         pika.ConnectionParameters(
-            host="host.docker.internal",
+            host="localhost",
             credentials=pika.PlainCredentials("admin", "admin123"),
         )
     )
