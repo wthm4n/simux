@@ -313,23 +313,29 @@ def _run_container_blocking(
     wall_limit: int,
     label:      str,
     *,
-    # extra_ulimits lets callers add ulimits on top of the base set
+    capture_stderr: bool       = False,  # True for compile stage — gcc/javac write errors to stderr
     extra_ulimits: list | None = None,
 ) -> dict:
     """
     Shared low-level harness used by both compile_in_docker and run_in_docker.
 
+    capture_stderr=True  → used by compile stage. SDK returns muxed bytes when
+                           both stdout+stderr=True; we demux manually to get
+                           compiler error text from stderr.
+    capture_stderr=False → used by exec stage. Only stdout matters for answer
+                           checking; avoids mux overhead.
+
     Returns a dict with keys:
-        stdout   str   — captured stdout (capped at MAX_OUTPUT_BYTES)
-        stderr   str   — error text on non-zero exit, else ""
-        time_ms  int   — wall-clock ms from thread start to join
+        stdout   str   — captured stdout
+        stderr   str   — captured stderr (compile stage) or "" (exec stage)
+        time_ms  int   — wall-clock ms
         error    str|None — None | "runtime_error" | "system_error"
         tle      bool
         ole      bool
-        oom      bool  — True if Docker reports OOMKilled
+        oom      bool
     """
     result_holder: dict = {}
-    full_cmd = f'sh -c "{command}"'
+    full_cmd = ['sh', '-c', command]
 
     base_ulimits = [
         docker.types.Ulimit(name="stack",  soft=67108864, hard=67108864),
@@ -339,6 +345,27 @@ def _run_container_blocking(
         docker.types.Ulimit(name="nproc",  soft=64,       hard=64),
     ]
     ulimits = base_ulimits + (extra_ulimits or [])
+
+    def _demux(raw: bytes) -> tuple[bytes, bytes]:
+        """
+        Docker multiplexes stdout+stderr into a single stream when both are
+        captured. Each frame: 8-byte header [stream_type(1), 0,0,0, size(4BE)]
+        followed by `size` bytes of payload. stream_type: 1=stdout, 2=stderr.
+        Returns (stdout_bytes, stderr_bytes).
+        """
+        import struct
+        stdout_chunks, stderr_chunks = [], []
+        offset = 0
+        while offset + 8 <= len(raw):
+            stream_type, _, _, _, size = struct.unpack_from('>BxxxI', raw, offset)
+            offset += 8
+            chunk = raw[offset:offset + size]
+            offset += size
+            if stream_type == 1:
+                stdout_chunks.append(chunk)
+            elif stream_type == 2:
+                stderr_chunks.append(chunk)
+        return b"".join(stdout_chunks), b"".join(stderr_chunks)
 
     def _run():
         try:
@@ -353,27 +380,40 @@ def _run_container_blocking(
                 memswap_limit="256m",
                 cpu_quota=50000,
                 cpu_period=100000,
-                pids_limit=64,
+                pids_limit=128,        # 64 was too tight: sh + compiler + linker/exec needs headroom
                 user="65534:65534",
                 cap_drop=["ALL"],
                 security_opt=_build_security_opts(),
                 ulimits=ulimits,
                 stdout=True,
-                stderr=False,
+                stderr=capture_stderr,  # True for compile (need gcc errors); False for exec
                 remove=True,
                 detach=False,
             )
-            ole    = len(raw) > MAX_OUTPUT_BYTES
-            stdout = raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace").strip()
-            result_holder["result"] = {"stdout": stdout, "exit_code": 0, "ole": ole}
+
+            if capture_stderr:
+                # SDK returns muxed frames when both stdout+stderr=True
+                stdout_raw, stderr_raw = _demux(raw)
+            else:
+                stdout_raw, stderr_raw = raw, b""
+
+            ole    = len(stdout_raw) > MAX_OUTPUT_BYTES
+            stdout = stdout_raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace").strip()
+            stderr = stderr_raw.decode("utf-8", errors="replace").strip()
+            result_holder["result"] = {"stdout": stdout, "stderr": stderr, "exit_code": 0, "ole": ole}
 
         except docker.errors.ContainerError as e:
             raw_err      = e.stderr if e.stderr else b""
             stderr_clean = raw_err.decode("utf-8", errors="replace").strip()
-            if stderr_clean in ("Killed", "") and not stderr_clean.startswith("/"):
+            exit_status  = getattr(e, 'exit_status', 1)
+            # exit_status 137 = SIGKILL (OOM or fsize ulimit hit).
+            # Any other non-zero is a genuine runtime/compile error.
+            # Do NOT classify empty stderr as OLE — that hides real errors.
+            if exit_status == 137 or stderr_clean == "Killed":
                 result_holder["ole"] = True
             else:
-                result_holder["runtime_error"] = stderr_clean[:65536]
+                msg = stderr_clean if stderr_clean else f"exited with code {exit_status} (no output)"
+                result_holder["runtime_error"] = msg[:65536]
 
         except Exception as exc:
             result_holder["exception"] = exc
