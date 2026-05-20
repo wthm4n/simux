@@ -242,26 +242,26 @@ LANGUAGE_CONFIG = {
         "image":       "node:20-slim",
         "filename":    "solution.js",
         "compile_cmd": None,
-        "exec_cmd": ["sh", "-c", "node --max-old-space-size=200 /code/solution.js < /code/input.txt"],
+        "exec_cmd":    ["node", "--max-old-space-size=200", "/code/solution.js"],
     },
     "c": {
         "image":       "gcc:13",
         "filename":    "solution.c",
         # 2>&1 is a shell construct — we capture stderr separately in compile stage
         "compile_cmd": ["gcc", "/code/solution.c", "-o", "/code/solution", "-O2", "-lm"],
-        "exec_cmd": ["sh", "-c", "/code/solution < /code/input.txt"],
+        "exec_cmd":    ["/code/solution"],
     },
     "cpp": {
         "image":       "gcc:13",
         "filename":    "solution.cpp",
         "compile_cmd": ["g++", "/code/solution.cpp", "-o", "/code/solution", "-O2", "-std=c++17"],
-        "exec_cmd": ["sh", "-c", "/code/solution < /code/input.txt"],
+        "exec_cmd":    ["/code/solution"],
     },
     "java": {
         "image":       "eclipse-temurin:21-jdk-alpine",
         "filename":    "Main.java",
         "compile_cmd": ["javac", "/code/Main.java"],
-       "exec_cmd": ["sh", "-c", "java -cp /code -Xmx200m Main < /code/input.txt"],
+        "exec_cmd":    ["java", "-cp", "/code", "-Xmx200m", "Main"],
     },
     "rust": {
         "image":       "rust:1.78-slim",
