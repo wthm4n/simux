@@ -23,11 +23,23 @@ const VERDICT_MAP = {
     bg: "bg-amber-950/40 border-amber-800",
     dot: "#fbbf24",
   },
+  MLE: {
+    label: "Memory Limit Exceeded",
+    color: "text-orange-400",
+    bg: "bg-orange-950/40 border-orange-800",
+    dot: "#fb923c",
+  },
   RE: {
     label: "Runtime Error",
     color: "text-orange-400",
     bg: "bg-orange-950/40 border-orange-800",
     dot: "#fb923c",
+  },
+  CE: {
+    label: "Compile Error",
+    color: "text-yellow-400",
+    bg: "bg-yellow-950/40 border-yellow-800",
+    dot: "#facc15",
   },
   SE: {
     label: "System Error",
@@ -74,6 +86,22 @@ function VerdictIcon({ verdict }) {
           strokeLinecap="round"
           strokeLinejoin="round"
         />
+      </svg>
+    );
+  if (verdict === "CE")
+    return (
+      <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+        <circle cx="24" cy="24" r="23" stroke="#facc15" strokeWidth="2" />
+        <path d="M17 17l7 7-7 7" stroke="#facc15" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+        <path d="M27 31h4"       stroke="#facc15" strokeWidth="2.5" strokeLinecap="round"/>
+      </svg>
+    );
+  if (verdict === "MLE")
+    return (
+      <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+        <circle cx="24" cy="24" r="23" stroke="#fb923c" strokeWidth="2" />
+        <rect x="15" y="20" width="18" height="12" rx="2" stroke="#fb923c" strokeWidth="2"/>
+        <path d="M19 20v-4a5 5 0 0110 0v4" stroke="#fb923c" strokeWidth="2" strokeLinecap="round"/>
       </svg>
     );
   return (
@@ -196,6 +224,18 @@ export default function Verdict() {
                 </p>
                 <p className="text-xs font-mono text-gray-400 truncate">{id}</p>
               </div>
+            </div>
+          )}
+
+          {/* Compiler error output */}
+          {isDone && data.verdict === "CE" && data.stderr && (
+            <div className="mb-6">
+              <p className="text-[10px] uppercase tracking-widest text-gray-600 font-semibold mb-2">
+                Compiler Output
+              </p>
+              <pre className="bg-surface rounded-lg px-4 py-3 text-xs font-mono text-yellow-300/80 overflow-x-auto whitespace-pre-wrap break-all max-h-48 overflow-y-auto">
+                {data.stderr}
+              </pre>
             </div>
           )}
 
