@@ -348,7 +348,7 @@ def _run_container_blocking(
     image:      str,
     command:    list[str],     # ← always a list; never sh -c
     tmp_dir:    str,
-    stdin_data: str,         # ← raw stdin bytes; empty for compile stage
+    stdin_data: bytes,         # ← raw stdin bytes; empty for compile stage
     wall_limit: int,
     label:      str,
     language:   str,
