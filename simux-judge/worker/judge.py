@@ -223,12 +223,9 @@ def setup_db():
 # ─────────────────────────────────────────────────────────────────────────────
 # Language config
 #
-# exec_cmd is now a list of strings — no shell, no sh -c, no injection surface.
-# Stdin is handled by writing input.txt and using stdin_open + socket.sendall,
-# which eliminates the extra fork that `sh -c "... < input.txt"` required.
-#
-# compile_cmd stays as a string because it's always a single compiler
-# invocation with a fixed argument list; we split it to a list at call time.
+# exec_cmd uses sh -c with shell redirection from /code/input.txt.
+# input.txt is written by run_test_in_docker before container launch.
+# compile_cmd stays as a list passed directly to execve (no shell needed).
 # ─────────────────────────────────────────────────────────────────────────────
 
 LANGUAGE_CONFIG = {
@@ -236,38 +233,37 @@ LANGUAGE_CONFIG = {
         "image":       "python:3.11-slim",
         "filename":    "solution.py",
         "compile_cmd": None,
-        "exec_cmd":    ["python", "-u", "/code/solution.py"],
+        "exec_cmd":    ["sh", "-c", "python -u /code/solution.py < /code/input.txt"],
     },
     "javascript": {
         "image":       "node:20-slim",
         "filename":    "solution.js",
         "compile_cmd": None,
-        "exec_cmd":    ["node", "--max-old-space-size=200", "/code/solution.js"],
+        "exec_cmd":    ["sh", "-c", "node --max-old-space-size=200 /code/solution.js < /code/input.txt"],
     },
     "c": {
         "image":       "gcc:13",
         "filename":    "solution.c",
-        # 2>&1 is a shell construct — we capture stderr separately in compile stage
         "compile_cmd": ["gcc", "/code/solution.c", "-o", "/code/solution", "-O2", "-lm"],
-        "exec_cmd":    ["/code/solution"],
+        "exec_cmd":    ["sh", "-c", "/code/solution < /code/input.txt"],
     },
     "cpp": {
         "image":       "gcc:13",
         "filename":    "solution.cpp",
         "compile_cmd": ["g++", "/code/solution.cpp", "-o", "/code/solution", "-O2", "-std=c++17"],
-        "exec_cmd":    ["/code/solution"],
+        "exec_cmd":    ["sh", "-c", "/code/solution < /code/input.txt"],
     },
     "java": {
         "image":       "eclipse-temurin:21-jdk-alpine",
         "filename":    "Main.java",
         "compile_cmd": ["javac", "/code/Main.java"],
-        "exec_cmd":    ["java", "-cp", "/code", "-Xmx200m", "Main"],
+        "exec_cmd":    ["sh", "-c", "java -cp /code -Xmx200m Main < /code/input.txt"],
     },
     "rust": {
         "image":       "rust:1.78-slim",
         "filename":    "solution.rs",
         "compile_cmd": ["rustc", "/code/solution.rs", "-o", "/code/solution", "--edition", "2021"],
-        "exec_cmd":    ["/code/solution"],
+        "exec_cmd":    ["sh", "-c", "/code/solution < /code/input.txt"],
     },
 }
 
@@ -323,32 +319,18 @@ _BASE_ULIMITS = [
 # ─────────────────────────────────────────────────────────────────────────────
 # Low-level container runner
 #
-# Key changes vs the old implementation:
-#
-#   1. exec_cmd is a list — passed directly to Docker, no sh -c wrapper.
-#      This eliminates: one fork, shell process overhead, shell injection
-#      surface, and the extra thread the shell holds open.
-#
-#   2. Stdin is fed via attach socket rather than shell redirection.
-#      The container is started with stdin_open=True, detach=True; we attach
-#      the socket, send the input bytes, close the write half, then wait for
-#      the container to exit. This is the same approach used by production
-#      judges (IOI isolate feeds stdin the same way).
-#
-#   3. Stdout is streamed in chunks with an early-exit on OLE, so a program
-#      printing infinite output doesn't buffer 10 MB before we notice.
-#
-#   4. The concurrency semaphore (_judge_sem) is acquired before container
-#      creation and released after removal, capping simultaneous containers
-#      system-wide regardless of which code path (judge / /execute) calls us.
+# stdin is fed via /code/input.txt written before container launch.
+# exec_cmd uses sh -c with shell redirection, so EOF is handled correctly.
+# stdout is collected after container.wait() — no streaming/hang risk.
+# OLE is checked on raw byte length before decode.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_container_blocking(
     client,
     image:      str,
-    command:    list[str],     # ← always a list; never sh -c
+    command:    list[str],
     tmp_dir:    str,
-    stdin_data: bytes,         # ← raw stdin bytes; empty for compile stage
+    stdin_data: str,           # kept in signature for compat; unused (input.txt used instead)
     wall_limit: int,
     label:      str,
     language:   str,
@@ -356,7 +338,7 @@ def _run_container_blocking(
     capture_stderr: bool = False,
 ) -> dict:
     """
-    Spin up one hardened container, feed it stdin, collect stdout/stderr.
+    Spin up one hardened container, collect stdout/stderr after exit.
 
     Returns:
         stdout   str
@@ -389,7 +371,6 @@ def _run_container_blocking(
                 cap_drop=["ALL"],
                 security_opt=_SECURITY_OPTS,
                 ulimits=_BASE_ULIMITS,
-                stdin_open=bool(stdin_data),  # only open stdin if we have input
                 stdout=True,
                 stderr=capture_stderr,
                 detach=True,
@@ -397,46 +378,28 @@ def _run_container_blocking(
 
             container.start()
 
-            # Feed stdin without a shell — attach to the container's stream,
-            # write input bytes, then close the write half so the program
-            # sees EOF. This replaces the old "< /code/input.txt" shell trick.
-            if stdin_data:
-                sock = container.attach_socket(params={"stdin": 1, "stream": 1})
-                try:
-                    sock._sock.sendall(stdin_data)
-                    sock._sock.shutdown(1)   # SHUT_WR → EOF to the process
-                finally:
-                    sock.close()
-
-            # Stream stdout in chunks — bail early on OLE
-            stdout_chunks: list[bytes] = []
-            total_bytes   = 0
-            ole           = False
-
-            for chunk in container.logs(stream=True, follow=True, stdout=True, stderr=False):
-                total_bytes += len(chunk)
-                if total_bytes > MAX_OUTPUT_BYTES:
-                    ole = True
-                    break
-                stdout_chunks.append(chunk)
-
-            exit_info   = container.wait(timeout=2)
+            # Wait for container to finish (up to wall_limit handled by thread join)
+            exit_info   = container.wait(timeout=wall_limit)
             exit_status = exit_info.get("StatusCode", 1)
 
-            stderr_text = ""
-            if capture_stderr:
-                raw_err    = container.logs(stdout=False, stderr=True)
-                stderr_text = raw_err.decode("utf-8", errors="replace").strip() if raw_err else ""
+            # Collect stdout after exit — no streaming, no hang
+            raw_stdout = container.logs(stdout=True, stderr=False)
 
-            if ole:
+            # OLE check on raw bytes
+            if len(raw_stdout) > MAX_OUTPUT_BYTES:
                 result_holder["ole"] = True
                 return
 
-            stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
+            stdout_text = raw_stdout.decode("utf-8", errors="replace").strip()
+
+            stderr_text = ""
+            if capture_stderr:
+                raw_err     = container.logs(stdout=False, stderr=True)
+                stderr_text = raw_err.decode("utf-8", errors="replace").strip() if raw_err else ""
 
             if exit_status == 137:
-                # SIGKILL → OOM or fsize ulimit
-                result_holder["ole"] = True
+                # SIGKILL → OOM
+                result_holder["oom"] = True
             elif exit_status != 0:
                 msg = stderr_text if stderr_text else f"exited with code {exit_status}"
                 result_holder["runtime_error"] = msg[:65536]
@@ -477,6 +440,11 @@ def _run_container_blocking(
         spinner.stop(ok=False, final_msg=f"Output limit exceeded ({elapsed} ms)")
         return {"stdout": "", "stderr": "Output limit exceeded", "time_ms": elapsed,
                 "error": None, "tle": False, "ole": True, "oom": False}
+
+    if result_holder.get("oom"):
+        spinner.stop(ok=False, final_msg=f"Memory limit exceeded ({elapsed} ms)")
+        return {"stdout": "", "stderr": "Memory limit exceeded", "time_ms": elapsed,
+                "error": None, "tle": False, "ole": False, "oom": True}
 
     if "runtime_error" in result_holder:
         stderr = result_holder["runtime_error"]
@@ -519,8 +487,7 @@ def _kill_orphan_containers(client, tmp_dir: str):
 def compile_in_docker(language: str, tmp_dir: str) -> dict:
     """
     Run the compiler inside a container. compile_cmd is a list — no shell.
-    Compiler output (errors) comes from stderr, which we capture directly
-    instead of the old 2>&1 shell redirect hack.
+    Compiler output (errors) comes from stderr, which we capture directly.
 
     Returns {"ok": True, "compile_ms": N}
           | {"ok": False, "verdict": "CE"|"SE", "stderr": "..."}
@@ -540,7 +507,7 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
         with _judge_sem:
             result = _run_container_blocking(
                 client, cfg["image"], compile_cmd, tmp_dir,
-                b"",            # compilers don't read stdin
+                "",             # compilers don't read stdin
                 wall_limit, label, language,
                 capture_stderr=True,   # compiler errors land on stderr
             )
@@ -553,7 +520,6 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
                 "stderr": f"Compilation timed out after {wall_limit}s"}
 
     if result["error"] == "runtime_error":
-        # Compiler exited non-zero — stderr holds the error text
         compiler_output = result["stderr"] or result["stdout"]
         _log("warn", f"CE: {compiler_output[:200]}")
         return {"ok": False, "verdict": "CE", "stderr": compiler_output}
@@ -568,9 +534,8 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2 — Execute one test case
 #
-# exec_cmd is a pre-built list from LANGUAGE_CONFIG — Docker passes it directly
-# to execve(), bypassing the shell entirely. stdin is sent over the attach
-# socket instead of shell redirection.
+# Writes input to /code/input.txt before launching the container.
+# exec_cmd uses sh -c with shell redirection, so stdin is read from the file.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_test_in_docker(
@@ -591,11 +556,17 @@ def run_test_in_docker(
     wall_limit = (time_limit_ms // 1000 + 2) if time_limit_ms else DEFAULT_TIMEOUT_S
     label      = f"Executing {language}  (wall: {wall_limit}s)…"
 
+    # Write stdin to input.txt — container reads it via shell redirection
+    input_path = os.path.join(tmp_dir, "input.txt")
+    with open(input_path, "w") as f:
+        f.write(stdin_input)
+    os.chmod(input_path, 0o666)
+
     try:
         with _judge_sem:
             return _run_container_blocking(
                 client, cfg["image"], cfg["exec_cmd"], tmp_dir,
-                stdin_input.encode(),   # fed via attach socket, not shell redirect
+                "",             # stdin_data unused; input.txt used instead
                 wall_limit, label, language,
             )
     except Exception as e:
@@ -834,10 +805,9 @@ def save_verdict(submission_id: str, result: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 # /execute endpoint  (used by the /run flow — sample cases only)
 #
-# Previously this called run_in_docker per test case, recompiling every time.
-# Now it mirrors judge(): compile once into a shared tmp_dir, then run each
-# test case against the same binary. The semaphore in run_test_in_docker
-# and compile_in_docker caps concurrency automatically.
+# Compile once into a shared tmp_dir, then run each test case against the
+# same binary. Semaphore in run_test_in_docker and compile_in_docker caps
+# concurrency automatically.
 # ─────────────────────────────────────────────────────────────────────────────
 
 run_api = Flask(__name__)
@@ -937,7 +907,7 @@ def on_message(ch, method, properties, body):
 
 
 def start_worker():
-    _header("Judge Worker  v2.1")
+    _header("Judge Worker  v2.2")
 
     with Spinner("Connecting to PostgreSQL…") as sp:
         setup_db()
@@ -981,5 +951,3 @@ def start_worker():
 
 if __name__ == "__main__":
     start_worker()
-ENDOFFILE
-echo "wrote $(wc -l < /home/claude/judge.py) lines"
