@@ -309,8 +309,11 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
     tmp_dir    = tempfile.mkdtemp()
     start      = time.time()
 
-    # Make the tmpdir world-readable so the nobody user inside the container
-    # can read the code and input files.
+    # chown the tmpdir to nobody:nogroup (65534) so the container user can:
+    #   - read source + input files
+    #   - write the compiled binary (gcc/g++/rustc output goes to /code/)
+    # Without this, compiled languages fail with "Permission denied" on link.
+    os.chown(tmp_dir, 65534, 65534)
     os.chmod(tmp_dir, 0o755)
 
     try:
@@ -322,7 +325,9 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
         with open(input_path, "w") as f:
             f.write(stdin_input)
 
-        # World-readable so nobody (65534) can read them
+        # Own + readable by nobody (65534)
+        os.chown(src_path,   65534, 65534)
+        os.chown(input_path, 65534, 65534)
         os.chmod(src_path,   0o644)
         os.chmod(input_path, 0o644)
 
@@ -395,8 +400,18 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
 
             except docker.errors.ContainerError as e:
                 # Non-zero exit — stderr is on the exception
-                stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
-                result_holder["runtime_error"] = stderr[:65536]
+                raw_err = e.stderr if e.stderr else b""
+                stderr  = raw_err.decode("utf-8", errors="replace")
+
+                # "Killed" with no other message = process was killed by the kernel
+                # due to a resource limit (fsize ulimit → too much output, or OOM).
+                # Treat as OLE if the stdout we captured so far is suspiciously large,
+                # or if stderr is literally just "Killed".
+                stderr_clean = stderr.strip()
+                if stderr_clean in ("Killed", "") and not stderr_clean.startswith("/"):
+                    result_holder["ole"] = True
+                else:
+                    result_holder["runtime_error"] = stderr_clean[:65536]
 
             except Exception as e:
                 result_holder["exception"] = e
@@ -426,6 +441,12 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
         if "exception" in result_holder:
             spinner.stop(ok=False, final_msg="Unexpected exception.")
             raise result_holder["exception"]
+
+        # ── OLE from ContainerError path (fsize/oom kill) ─────────────────
+        if result_holder.get("ole"):
+            spinner.stop(ok=False, final_msg=f"Output limit exceeded ({elapsed} ms)")
+            return {"stdout": "", "stderr": "Output limit exceeded", "time_ms": elapsed,
+                    "error": None, "ole": True}
 
         # ── Runtime error (ContainerError) ───────────────────────────────
         if "runtime_error" in result_holder:
