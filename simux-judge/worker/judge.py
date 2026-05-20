@@ -236,7 +236,7 @@ LANGUAGE_CONFIG = {
         "image":       "python:3.11-slim",
         "filename":    "solution.py",
         "compile_cmd": None,
-        "exec_cmd":    ["python", "-u", "/code/solution.py"],
+        "exec_cmd": ["sh", "-c", "python -u /code/solution.py < /code/input.txt"],
     },
     "javascript": {
         "image":       "node:20-slim",
