@@ -249,7 +249,7 @@ LANGUAGE_CONFIG = {
         "filename":    "solution.c",
         # 2>&1 is a shell construct — we capture stderr separately in compile stage
         "compile_cmd": ["gcc", "/code/solution.c", "-o", "/code/solution", "-O2", "-lm"],
-        "exec_cmd":    ["/code/solution"],
+        "exec_cmd": ["sh", "-c", "/code/solution < /code/input.txt"],
     },
     "cpp": {
         "image":       "gcc:13",
