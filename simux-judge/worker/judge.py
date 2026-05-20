@@ -389,6 +389,9 @@ def _run_container_blocking(
                 cap_drop=["ALL"],
                 security_opt=_SECURITY_OPTS,
                 ulimits=_BASE_ULIMITS,
+                stdin_open=bool(stdin_data),  # only open stdin if we have input
+                stdout=True,
+                stderr=capture_stderr,
                 detach=True,
             )
 
@@ -397,6 +400,13 @@ def _run_container_blocking(
             # Feed stdin without a shell — attach to the container's stream,
             # write input bytes, then close the write half so the program
             # sees EOF. This replaces the old "< /code/input.txt" shell trick.
+            if stdin_data:
+                sock = container.attach_socket(params={"stdin": 1, "stream": 1})
+                try:
+                    sock._sock.sendall(stdin_data)
+                    sock._sock.shutdown(1)   # SHUT_WR → EOF to the process
+                finally:
+                    sock.close()
 
             # Stream stdout in chunks — bail early on OLE
             stdout_chunks: list[bytes] = []
@@ -583,14 +593,6 @@ def run_test_in_docker(
 
     try:
         with _judge_sem:
-
-            input_path = os.path.join(tmp_dir, "input.txt")
-
-            with open(input_path, "w") as f:
-             f.write(stdin_input)
-
-os.chmod(input_path, 0o666)
-
             return _run_container_blocking(
                 client, cfg["image"], cfg["exec_cmd"], tmp_dir,
                 stdin_input.encode(),   # fed via attach socket, not shell redirect
