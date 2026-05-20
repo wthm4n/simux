@@ -2,12 +2,13 @@ import subprocess
 import time
 import threading
 import itertools
-import os
+import hashlib
 import sys
+import os
 from datetime import datetime
 
 # ─────────────────────────────────────────────────────────────
-# Terminal UI
+# COLORS / UI
 # ─────────────────────────────────────────────────────────────
 
 class C:
@@ -41,7 +42,7 @@ def ts():
     return c(f"[{datetime.now().strftime('%H:%M:%S')}]", C.DIM)
 
 
-def divider(char="━", width=72):
+def divider(char="━", width=84):
     print(c(char * width, C.DIM))
 
 
@@ -49,11 +50,33 @@ def header(title):
     divider()
 
     print(
-        c(" SIMUX AUTO PUSHER ", C.BOLD, C.BRIGHT_MAGENTA) +
+        c(" SIMUX SMART PUSHER ", C.BOLD, C.BRIGHT_MAGENTA) +
         c(f" {title}", C.BRIGHT_CYAN)
     )
 
     divider()
+
+
+def box(title, rows):
+    width = 84
+
+    print(c(f"┏{'━' * (width - 2)}┓", C.DIM))
+    print(
+        c("┃ ", C.DIM) +
+        c(title.ljust(width - 4), C.BOLD, C.BRIGHT_CYAN) +
+        c(" ┃", C.DIM)
+    )
+    print(c(f"┣{'━' * (width - 2)}┫", C.DIM))
+
+    for row in rows:
+        clean = row[:width - 6]
+        print(
+            c("┃ ", C.DIM) +
+            clean.ljust(width - 4) +
+            c(" ┃", C.DIM)
+        )
+
+    print(c(f"┗{'━' * (width - 2)}┛", C.DIM))
 
 
 def log(level, msg):
@@ -64,6 +87,7 @@ def log(level, msg):
         "error": ("✖", C.BRIGHT_RED),
         "git": ("◆", C.BRIGHT_MAGENTA),
         "push": ("⬆", C.BRIGHT_CYAN),
+        "commit": ("⬤", C.BRIGHT_GREEN),
     }
 
     icon, color = icons.get(level, ("•", C.WHITE))
@@ -74,15 +98,19 @@ def log(level, msg):
 
 
 # ─────────────────────────────────────────────────────────────
-# Spinner
+# SPINNER
 # ─────────────────────────────────────────────────────────────
 
 class Spinner:
-    FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+    FRAMES = [
+        "⠋","⠙","⠹","⠸","⠼",
+        "⠴","⠦","⠧","⠇","⠏"
+    ]
 
     def __init__(self, label):
         self.label = label
         self.stop_event = threading.Event()
+
         self.thread = threading.Thread(
             target=self.animate,
             daemon=True
@@ -90,6 +118,7 @@ class Spinner:
 
     def animate(self):
         for frame in itertools.cycle(self.FRAMES):
+
             if self.stop_event.is_set():
                 break
 
@@ -98,9 +127,10 @@ class Spinner:
             )
 
             sys.stdout.flush()
+
             time.sleep(0.08)
 
-        sys.stdout.write("\r" + " " * (len(self.label) + 10) + "\r")
+        sys.stdout.write("\r" + " " * 120 + "\r")
         sys.stdout.flush()
 
     def start(self):
@@ -121,85 +151,174 @@ class Spinner:
 
 
 # ─────────────────────────────────────────────────────────────
-# Config
+# CONFIG
 # ─────────────────────────────────────────────────────────────
 
-last_commit = ""
+PUSH_INTERVAL = 5
 
 IGNORE = {
     ".git",
-    "__pycache__",
-    "venv",
     "node_modules",
+    "__pycache__",
     ".next",
     "dist",
     "build",
+    "venv"
 }
 
+last_hashes = {}
+pending_push = False
+last_push = time.time()
 
 # ─────────────────────────────────────────────────────────────
-# Helpers
+# HELPERS
 # ─────────────────────────────────────────────────────────────
 
-def run(cmd, capture=True):
-    if capture:
-        return subprocess.check_output(
-            cmd,
-            shell=True,
-            text=True
-        ).strip()
-
-    return subprocess.run(cmd, shell=True)
+def run(cmd):
+    return subprocess.check_output(
+        cmd,
+        shell=True,
+        text=True
+    ).strip()
 
 
-def generate_commit_message(files):
-    categorized = {
-        "frontend": [],
-        "backend": [],
-        "config": [],
-        "docs": [],
-        "other": [],
-    }
+def silent(cmd):
+    return subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
 
-    for file in files:
-        lower = file.lower()
 
-        if any(x in lower for x in ["react", "tailwind", "component", "page", "frontend"]):
-            categorized["frontend"].append(file)
+def get_changed_files():
+    try:
+        status = run("git status --porcelain")
+    except:
+        return []
 
-        elif any(x in lower for x in ["api", "server", "backend", "judge", "worker"]):
-            categorized["backend"].append(file)
+    files = []
 
-        elif any(x in lower for x in [".json", ".env", "config"]):
-            categorized["config"].append(file)
+    for line in status.splitlines():
+        file = line[3:]
 
-        elif any(x in lower for x in ["readme", ".md", "docs"]):
-            categorized["docs"].append(file)
+        if not any(x in file for x in IGNORE):
+            files.append(file)
 
-        else:
-            categorized["other"].append(file)
+    return files
 
-    parts = []
 
-    for category, arr in categorized.items():
-        if arr:
-            parts.append(category)
+def get_hash(file):
+    try:
+        with open(file, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except:
+        return None
 
-    if not parts:
-        return "Minor project updates"
 
-    return f"Updated {' + '.join(parts)} modules"
+def get_diff(file):
+    try:
+        return run(f'git diff "{file}"')
+    except:
+        return ""
 
 
 # ─────────────────────────────────────────────────────────────
-# Startup
+# SMART COMMIT MSG
+# ─────────────────────────────────────────────────────────────
+
+def generate_commit_message(file, diff):
+    lower = file.lower()
+
+    additions = diff.count("\n+")
+    deletions = diff.count("\n-")
+
+    if "judge" in lower:
+        return "feat(judge): improve execution handling"
+
+    if "auth" in lower or "login" in lower:
+        return "fix(auth): improve authentication flow"
+
+    if lower.endswith(".jsx"):
+        if additions > deletions:
+            return f"ui: enhance {os.path.basename(file)}"
+
+        return f"ui: refine {os.path.basename(file)}"
+
+    if lower.endswith(".py"):
+        return f"backend: update {os.path.basename(file)}"
+
+    if lower.endswith(".js"):
+        return f"core: improve {os.path.basename(file)}"
+
+    if lower.endswith(".css"):
+        return f"style: update {os.path.basename(file)}"
+
+    return f"chore: modify {os.path.basename(file)}"
+
+
+# ─────────────────────────────────────────────────────────────
+# COMMIT SINGLE FILE
+# ─────────────────────────────────────────────────────────────
+
+def commit_file(file):
+    global pending_push
+
+    current_hash = get_hash(file)
+
+    if current_hash == last_hashes.get(file):
+        return
+
+    diff = get_diff(file)
+
+    if not diff.strip():
+        return
+
+    commit_msg = generate_commit_message(file, diff)
+
+    spinner = Spinner(
+        f"Committing {os.path.basename(file)}..."
+    ).start()
+
+    silent(f'git add "{file}"')
+
+    commit = silent(
+        f'git commit -m "{commit_msg}" "{file}"'
+    )
+
+    if commit.returncode == 0:
+
+        spinner.stop(
+            True,
+            f"Committed {os.path.basename(file)}"
+        )
+
+        box(
+            "NEW COMMIT",
+            [
+                f"{c('FILE', C.BRIGHT_MAGENTA)}     → {c(file, C.BRIGHT_WHITE)}",
+                f"{c('MESSAGE', C.BRIGHT_CYAN)}  → {c(commit_msg, C.BRIGHT_GREEN)}",
+                f"{c('STATUS', C.BRIGHT_YELLOW)}   → {c('SYNC QUEUED', C.BRIGHT_YELLOW)}",
+            ]
+        )
+
+        last_hashes[file] = current_hash
+
+        pending_push = True
+
+    else:
+        spinner.stop(False, f"Skipped {file}")
+
+
+# ─────────────────────────────────────────────────────────────
+# STARTUP
 # ─────────────────────────────────────────────────────────────
 
 header("Git Automation Service")
 
 log(
     "info",
-    f"Watching repository → {c(os.getcwd(), C.BRIGHT_CYAN)}"
+    f"Repository → {c(os.getcwd(), C.BRIGHT_CYAN)}"
 )
 
 log(
@@ -210,105 +329,69 @@ log(
 divider()
 
 # ─────────────────────────────────────────────────────────────
-# Main Loop
+# LOOP
 # ─────────────────────────────────────────────────────────────
 
 while True:
+
     try:
-        status = run("git status --porcelain")
+        changed = get_changed_files()
 
-        if status:
-            changed_files = []
+        if changed:
 
-            for line in status.splitlines():
-                parts = line.strip().split()
+            box(
+                "DETECTED CHANGES",
+                [
+                    f"{c('FILES', C.BRIGHT_MAGENTA)} → {c(', '.join(changed[:5]), C.BRIGHT_WHITE)}"
+                ]
+            )
 
-                if len(parts) >= 2:
-                    file = parts[-1]
+            for file in changed:
+                commit_file(file)
 
-                    if not any(ignore in file for ignore in IGNORE):
-                        changed_files.append(file)
+        if pending_push:
 
-            if changed_files:
-                short = ", ".join(changed_files[:4])
+            now = time.time()
 
-                log(
-                    "git",
-                    f"Changes detected → {c(short, C.BRIGHT_YELLOW)}"
+            if now - last_push >= PUSH_INTERVAL:
+
+                spinner = Spinner(
+                    "Pushing commits to GitHub..."
+                ).start()
+
+                push = silent("git push")
+
+                spinner.stop(
+                    push.returncode == 0,
+                    "GitHub sync complete"
+                    if push.returncode == 0
+                    else "Push failed"
                 )
 
-                if len(changed_files) > 4:
-                    log(
-                        "dim",
-                        f"+ {len(changed_files) - 4} more files"
+                if push.returncode == 0:
+
+                    box(
+                        "REMOTE SYNC",
+                        [
+                            f"{c('STATUS', C.BRIGHT_GREEN)} → {c('ALL COMMITS PUSHED', C.BRIGHT_GREEN)}",
+                            f"{c('TIME', C.BRIGHT_CYAN)}   → {c(datetime.now().strftime('%H:%M:%S'), C.BRIGHT_WHITE)}"
+                        ]
                     )
 
-                commit_message = generate_commit_message(changed_files)
-
-                if commit_message != last_commit:
-
-                    spinner = Spinner(
-                        "Staging, committing & pushing..."
-                    ).start()
-
-                    subprocess.run(
-                        "git add .",
-                        shell=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-
-                    commit = subprocess.run(
-                        f'git commit -m "{commit_message}"',
-                        shell=True,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-
-                    if commit.returncode == 0:
-
-                        push = subprocess.run(
-                            "git push",
-                            shell=True,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL
-                        )
-
-                        spinner.stop(
-                            push.returncode == 0,
-                            "Changes synced to GitHub"
-                            if push.returncode == 0
-                            else "Push failed"
-                        )
-
-                        if push.returncode == 0:
-                            log(
-                                "push",
-                                f"Commit → {c(commit_message, C.BRIGHT_MAGENTA)}"
-                            )
-
-                            log(
-                                "ok",
-                                f"Files synced → {c(len(changed_files), C.BRIGHT_GREEN)}"
-                            )
-
-                            divider()
-
-                            last_commit = commit_message
-
-                    else:
-                        spinner.stop(False, "Nothing new to commit")
+                    pending_push = False
+                    last_push = now
 
         time.sleep(2)
 
     except KeyboardInterrupt:
+
         print()
 
         divider()
 
         log(
             "warn",
-            "Auto pusher stopped by user"
+            "Smart pusher stopped"
         )
 
         divider()
@@ -316,6 +399,7 @@ while True:
         break
 
     except Exception as e:
+
         log(
             "error",
             f"{type(e).__name__}: {e}"
