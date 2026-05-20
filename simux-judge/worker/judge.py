@@ -371,8 +371,6 @@ def _run_container_blocking(
                 cap_drop=["ALL"],
                 security_opt=_SECURITY_OPTS,
                 ulimits=_BASE_ULIMITS,
-                stdout=True,
-                stderr=capture_stderr,
                 detach=True,
             )
 
