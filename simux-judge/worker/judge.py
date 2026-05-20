@@ -17,9 +17,6 @@ _dir = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_dir, '.env'))
 
 # ── Seccomp profile path ──────────────────────────────────────────────────────
-# Auto-resolves to ../sandbox/seccomp.json relative to this file (worker/judge.py).
-# Override by setting SECCOMP_PROFILE_PATH in worker/.env — use an absolute path.
-# If the env var is set to the old placeholder value, ignore it and use the default.
 _env_seccomp = os.environ.get("SECCOMP_PROFILE_PATH", "")
 _default_seccomp = os.path.normpath(os.path.join(_dir, "..", "sandbox", "seccomp.json"))
 
@@ -33,7 +30,49 @@ MAX_OUTPUT_BYTES = 10 * 1024 * 1024
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Terminal display helpers (unchanged)
+# pids_limit — per language
+#
+# Docker counts ALL threads (not just processes) against pids_limit.
+# "sh: 1: Cannot fork" means the limit is hit before the runtime even starts.
+#
+# Breakdown of why each value is set:
+#
+#   c / cpp / rust  — compiled binary: sh(1) + binary(1) + maybe a few
+#                     OS threads = 16 is plenty; use 32 for headroom.
+#
+#   python          — CPython spawns a handful of threads for GIL bookkeeping
+#                     and the optional GC thread; ~6 total. 32 is safe.
+#
+#   javascript      — Node.js V8 + libuv spawn ~10–14 threads (V8 isolate,
+#                     timer, I/O workers). 64 is safe.
+#
+#   java            — JVM is the worst offender: GC threads, JIT compiler
+#                     threads, reference handler, finalizer, signal dispatcher,
+#                     attach listener... easily 20–30 threads on a tiny program.
+#                     eclipse-temurin:21 peaks ~35 threads. Use 128.
+#
+# Compile stage uses the same image as execution, so compile containers
+# get the same limit. gcc/g++/rustc are single-process; javac forks the
+# JVM so it also needs the java limit.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PIDS_LIMIT: dict[str, int] = {
+    "c":          32,
+    "cpp":        32,
+    "rust":       32,
+    "python":     32,
+    "javascript": 64,
+    "java":       128,
+}
+_PIDS_LIMIT_DEFAULT = 64   # fallback for any future language
+
+
+def _pids_limit_for(language: str) -> int:
+    return _PIDS_LIMIT.get(language, _PIDS_LIMIT_DEFAULT)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Terminal display helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 class C:
@@ -195,7 +234,6 @@ def setup_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     """)
-    # Add columns that may be missing on older installs
     for col, typ in [("test_results", "JSONB"), ("memory_kb", "INTEGER")]:
         cur.execute(f"ALTER TABLE submissions ADD COLUMN IF NOT EXISTS {col} {typ}")
     conn.commit()
@@ -209,10 +247,6 @@ def setup_db():
 # ─────────────────────────────────────────────────────────────────────────────
 
 LANGUAGE_CONFIG = {
-    # ── Interpreted — no compile stage, no syntax-check container.
-    #    Syntax errors surface as RE with a readable traceback from the runtime.
-    #    A separate py_compile / node --check container costs a full spawn for
-    #    zero benefit over letting the runtime reject it on the first test case.
     "python": {
         "image":       "python:3.11-slim",
         "filename":    "solution.py",
@@ -225,8 +259,6 @@ LANGUAGE_CONFIG = {
         "compile_cmd": None,
         "exec_cmd":    "node --max-old-space-size=200 /code/solution.js < /code/input.txt",
     },
-
-    # ── Compiled — compile_cmd runs once; exec_cmd runs per test case. ────────
     "c": {
         "image":       "gcc:13",
         "filename":    "solution.c",
@@ -253,16 +285,14 @@ LANGUAGE_CONFIG = {
     },
 }
 
-COMPILE_TIMEOUT_S  = 30   # wall-clock for the compile container
-DEFAULT_TIMEOUT_S  = 10   # wall-clock per test-case execution container
+COMPILE_TIMEOUT_S  = 30
+DEFAULT_TIMEOUT_S  = 10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Seccomp loader
+# Seccomp loader — cached at module load time
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Cached at module load time — read once, reused for every container run.
-# This also means the warning only prints once at startup, not per submission.
 def _build_security_opts_once() -> list[str]:
     path = os.path.abspath(SECCOMP_PROFILE_PATH)
     opts = ["no-new-privileges"]
@@ -278,32 +308,12 @@ def _build_security_opts_once() -> list[str]:
         _log("warn", f"Failed to load seccomp: {e} — using Docker default")
     return opts
 
-# Build once at import time
 _SECURITY_OPTS: list[str] = _build_security_opts_once()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hardened Docker runner
-#
-# Security flags applied to EVERY container:
-#   network_disabled  — no outbound network
-#   mem_limit         — 256 MB RAM hard cap
-#   memswap_limit     — equal to mem_limit → no swap
-#   cpu_quota         — 50% of one CPU core
-#   pids_limit        — 64 processes max (prevents fork bombs)
-#   read_only         — root filesystem is read-only
-#   tmpfs /tmp        — 64 MB writable scratch for runtimes that need it
-#   user nobody       — runs as uid 65534, not root
-#   cap_drop ALL      — all Linux capabilities dropped
-#   security_opt      — no-new-privileges + custom seccomp whitelist
-#   ulimits           — 64 MB stack/fsize, no core dumps, 64 fds
-#   stdout cap        — OLE verdict if output > 10 MB
-#   logs before rm    — container.logs() called BEFORE container.remove()
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _build_security_opts() -> list[str]:
-    return _SECURITY_OPTS
-
 
 def _run_container_blocking(
     client,
@@ -312,27 +322,25 @@ def _run_container_blocking(
     tmp_dir:    str,
     wall_limit: int,
     label:      str,
+    language:   str,          # ← NEW: used to look up the correct pids_limit
     *,
-    capture_stderr: bool       = False,  # True for compile stage — gcc/javac write errors to stderr
+    capture_stderr: bool       = False,
     extra_ulimits: list | None = None,
 ) -> dict:
     """
     Shared low-level harness used by both compile_in_docker and run_in_docker.
 
-    capture_stderr=True  → used by compile stage. SDK returns muxed bytes when
-                           both stdout+stderr=True; we demux manually to get
-                           compiler error text from stderr.
-    capture_stderr=False → used by exec stage. Only stdout matters for answer
-                           checking; avoids mux overhead.
+    The `language` parameter is used to look up the correct pids_limit value.
+    Docker counts ALL threads (not just POSIX processes) against pids_limit,
+    so each runtime needs its own tuned ceiling:
 
-    Returns a dict with keys:
-        stdout   str   — captured stdout
-        stderr   str   — captured stderr (compile stage) or "" (exec stage)
-        time_ms  int   — wall-clock ms
-        error    str|None — None | "runtime_error" | "system_error"
-        tle      bool
-        ole      bool
-        oom      bool
+        c/cpp/rust  → 32   (sh + binary + a handful of OS threads)
+        python      → 32   (CPython GIL + GC threads, ~6 total)
+        javascript  → 64   (V8 + libuv worker pool, ~10–14 threads)
+        java        → 128  (JVM GC + JIT + reference handler + ..., ~25–35)
+
+    Using a single global value (e.g. 128) would be unnecessarily permissive
+    for C/Python and still too low for the JVM on some hosts.
     """
     result_holder: dict = {}
     full_cmd = ['sh', '-c', command]
@@ -344,15 +352,10 @@ def _run_container_blocking(
         docker.types.Ulimit(name="nofile", soft=64,       hard=64),
         docker.types.Ulimit(name="nproc",  soft=64,       hard=64),
     ]
-    ulimits = base_ulimits + (extra_ulimits or [])
+    ulimits   = base_ulimits + (extra_ulimits or [])
+    pids_cap  = _pids_limit_for(language)
 
     def _demux(raw: bytes) -> tuple[bytes, bytes]:
-        """
-        Docker multiplexes stdout+stderr into a single stream when both are
-        captured. Each frame: 8-byte header [stream_type(1), 0,0,0, size(4BE)]
-        followed by `size` bytes of payload. stream_type: 1=stdout, 2=stderr.
-        Returns (stdout_bytes, stderr_bytes).
-        """
         import struct
         stdout_chunks, stderr_chunks = [], []
         offset = 0
@@ -380,19 +383,18 @@ def _run_container_blocking(
                 memswap_limit="256m",
                 cpu_quota=50000,
                 cpu_period=100000,
-                pids_limit=128,        # 64 was too tight: sh + compiler + linker/exec needs headroom
+                pids_limit=pids_cap,       # ← per-language value
                 user="65534:65534",
                 cap_drop=["ALL"],
-                security_opt=_build_security_opts(),
+                security_opt=_SECURITY_OPTS,
                 ulimits=ulimits,
                 stdout=True,
-                stderr=capture_stderr,  # True for compile (need gcc errors); False for exec
+                stderr=capture_stderr,
                 remove=True,
                 detach=False,
             )
 
             if capture_stderr:
-                # SDK returns muxed frames when both stdout+stderr=True
                 stdout_raw, stderr_raw = _demux(raw)
             else:
                 stdout_raw, stderr_raw = raw, b""
@@ -406,9 +408,6 @@ def _run_container_blocking(
             raw_err      = e.stderr if e.stderr else b""
             stderr_clean = raw_err.decode("utf-8", errors="replace").strip()
             exit_status  = getattr(e, 'exit_status', 1)
-            # exit_status 137 = SIGKILL (OOM or fsize ulimit hit).
-            # Any other non-zero is a genuine runtime/compile error.
-            # Do NOT classify empty stderr as OLE — that hides real errors.
             if exit_status == 137 or stderr_clean == "Killed":
                 result_holder["ole"] = True
             else:
@@ -468,28 +467,15 @@ def _run_container_blocking(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1 — Compile
-#
-# Runs the compiler once per submission and writes the binary into tmp_dir.
-# Returns a verdict dict:
-#   {"ok": True}
-#   {"ok": False, "verdict": "CE", "stderr": "...compiler output..."}
-#   {"ok": False, "verdict": "SE", "stderr": "..."}
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compile_in_docker(language: str, tmp_dir: str) -> dict:
-    """
-    Compile the source already written into tmp_dir.
-    Interpreted languages (compile_cmd=None) skip this entirely — returns ok immediately.
-    For compiled languages this produces the binary consumed by run_test_in_docker.
-    """
     cfg         = LANGUAGE_CONFIG[language]
     compile_cmd = cfg.get("compile_cmd")
 
-    # ── Interpreted: nothing to compile, skip ────────────────────────────────
     if compile_cmd is None:
         return {"ok": True, "compile_ms": 0}
 
-    # ── Compiled: run the compiler once ──────────────────────────────────────
     client     = docker.from_env()
     wall_limit = COMPILE_TIMEOUT_S
     label      = f"Compiling {language}  (wall: {wall_limit}s)…"
@@ -498,6 +484,8 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
     try:
         result = _run_container_blocking(
             client, cfg["image"], compile_cmd, tmp_dir, wall_limit, label,
+            language,                   # ← pass language for pids_limit lookup
+            capture_stderr=True,
         )
     except Exception as e:
         _log("error", f"Compile stage SE: {e}")
@@ -508,8 +496,6 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
                 "stderr": f"Compilation timed out after {wall_limit}s"}
 
     if result["error"] == "runtime_error":
-        # Compiler exited non-zero → CE.
-        # compile_cmd uses 2>&1 so compiler error text is in stdout.
         compiler_output = result["stdout"] or result["stderr"]
         _log("warn", f"CE: {compiler_output[:200]}")
         return {"ok": False, "verdict": "CE", "stderr": compiler_output}
@@ -523,21 +509,9 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2 — Execute one test case
-#
-# The binary / source is already in tmp_dir from Stage 1.
-# Timing starts HERE — compile time is NOT included.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
-    """
-    Public API kept identical to the old signature so /execute endpoint
-    (used by /run) continues to work unchanged.
-
-    For /run (sample cases only) this is called without pre-compilation,
-    so we still do compile+run in sequence inside a single tmp_dir.
-    The judge() function bypasses this and calls compile_in_docker once
-    then run_test_in_docker per test case.
-    """
     cfg = LANGUAGE_CONFIG.get(language)
     if cfg is None:
         _log("error", f"Unsupported language: '{language}'")
@@ -558,16 +532,14 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
 
         _log("dim", f"Sandbox mount  → {tmp_dir}")
 
-        # ── Compile / syntax-check ────────────────────────────────────────
         compile_result = compile_in_docker(language, tmp_dir)
         if not compile_result["ok"]:
-            verdict = compile_result["verdict"]   # "CE" or "SE"
+            verdict = compile_result["verdict"]
             stderr  = compile_result["stderr"]
             return {"stdout": "", "stderr": stderr, "time_ms": 0,
                     "error": "compile_error" if verdict == "CE" else "system_error",
                     "verdict": verdict}
 
-        # ── Execute ───────────────────────────────────────────────────────
         return run_test_in_docker(language, tmp_dir, stdin_input, auto_cleanup=False)
 
     except Exception as e:
@@ -583,14 +555,9 @@ def run_test_in_docker(
     tmp_dir:      str,
     stdin_input:  str = "",
     *,
-    time_limit_ms: int  = 0,     # 0 = use DEFAULT_TIMEOUT_S
-    auto_cleanup: bool  = True,  # set False when caller owns tmp_dir lifetime
+    time_limit_ms: int  = 0,
+    auto_cleanup: bool  = True,
 ) -> dict:
-    """
-    Execute the already-compiled binary / source for one test case.
-    tmp_dir must already contain the compiled artifact and will receive input.txt.
-    Timing is wall-clock of this container ONLY — no compile time.
-    """
     cfg        = LANGUAGE_CONFIG[language]
     client     = docker.from_env()
     exec_cmd   = cfg["exec_cmd"]
@@ -605,6 +572,7 @@ def run_test_in_docker(
         label  = f"Executing {language}  (wall: {wall_limit}s)…"
         result = _run_container_blocking(
             client, cfg["image"], exec_cmd, tmp_dir, wall_limit, label,
+            language,                   # ← pass language for pids_limit lookup
         )
         return result
 
@@ -619,7 +587,6 @@ def run_test_in_docker(
 
 
 def _kill_orphan_containers(client, tmp_dir: str):
-    """Kill any containers that are still mounted on our tmpdir."""
     try:
         for c in client.containers.list():
             mounts = str(c.attrs.get("Mounts", ""))
@@ -635,7 +602,7 @@ def _kill_orphan_containers(client, tmp_dir: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Judge — per-test breakdown with OLE verdict support
+# Judge
 # ─────────────────────────────────────────────────────────────────────────────
 
 def judge(submission_id: str, language: str, code: str, test_cases: list) -> dict:
@@ -644,7 +611,7 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
     display_rows = []
     test_results = []
     passed       = 0
-    result       = {}   # last test result, used for final time_ms
+    result       = {}
 
     def _skip_remaining(from_idx: int, verdict_code: str):
         for j in range(from_idx, len(test_cases)):
@@ -660,9 +627,7 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
                 "is_sample": test_cases[j].get("is_sample", False),
             })
 
-    # ── Stage 1: Compile once ─────────────────────────────────────────────────
-    # Source lands in tmp_dir; compiled binary stays there for all test cases.
-    cfg     = LANGUAGE_CONFIG.get(language)
+    cfg = LANGUAGE_CONFIG.get(language)
     if cfg is None:
         _log("error", f"Unsupported language: '{language}'")
         return {"verdict": "SE", "time_ms": 0, "test_results": []}
@@ -678,7 +643,7 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
     compile_result = compile_in_docker(language, tmp_dir)
 
     if not compile_result["ok"]:
-        verdict = compile_result["verdict"]   # "CE" or "SE"
+        verdict = compile_result["verdict"]
         stderr  = compile_result["stderr"]
         shutil.rmtree(tmp_dir, ignore_errors=True)
         for j, tc in enumerate(test_cases):
@@ -696,7 +661,6 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
     compile_ms = compile_result.get("compile_ms", 0)
     _log("ok", f"Compiled in {compile_ms} ms — running {len(test_cases)} test case(s)")
 
-    # ── Stage 2: Execute each test case ──────────────────────────────────────
     try:
         for i, tc in enumerate(test_cases):
             n         = i + 1
@@ -704,7 +668,6 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
                                            auto_cleanup=False)
             is_sample = tc.get("is_sample", False)
 
-            # ── Output Limit Exceeded ─────────────────────────────────────
             if result.get("ole"):
                 display_rows.append({"n": n, "status": "ole", "input": tc["input"],
                                       "expected": tc.get("expected_output",""), "got": "[truncated]", "time_ms": result["time_ms"]})
@@ -716,7 +679,6 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
                 _summary_row(submission_id, language, "OLE", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "OLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
 
-            # ── TLE (wall-clock timeout) ──────────────────────────────────
             if result.get("tle"):
                 display_rows.append({"n": n, "status": "tle", "input": tc["input"],
                                       "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
@@ -728,7 +690,6 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
                 _summary_row(submission_id, language, "TLE", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "TLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
 
-            # ── OOM killed → MLE ──────────────────────────────────────────
             if result.get("oom"):
                 display_rows.append({"n": n, "status": "error", "input": tc["input"],
                                       "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
@@ -740,7 +701,6 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
                 _summary_row(submission_id, language, "MLE", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "MLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
 
-            # ── System error ──────────────────────────────────────────────
             if result.get("error") == "system_error":
                 _log("error", f"System error on test #{n}: {result['stderr'][:200]}")
                 _verdict_banner("SE")
@@ -749,7 +709,6 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
                                       "is_sample": is_sample})
                 return {"verdict": "SE", "detail": result["stderr"], "test_results": test_results}
 
-            # ── Runtime error ─────────────────────────────────────────────
             if result.get("error") == "runtime_error":
                 display_rows.append({"n": n, "status": "error", "input": tc["input"],
                                       "expected": tc.get("expected_output",""), "got": "—",
@@ -762,8 +721,6 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
                 _summary_row(submission_id, language, "RE", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "RE", "detail": result["stderr"], "test": n, "test_results": test_results}
 
-            # ── Runtime TLE (execution time_ms exceeds problem limit) ─────
-            # DEFAULT_TIMEOUT_S is the hard wall; this catches soft per-problem limits.
             if result["time_ms"] > 2000:
                 display_rows.append({"n": n, "status": "tle", "input": tc["input"],
                                       "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
@@ -778,7 +735,6 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
             expected = tc["expected_output"].strip()
             actual   = result["stdout"].strip()
 
-            # ── Wrong answer ──────────────────────────────────────────────
             if actual != expected:
                 display_rows.append({"n": n, "status": "fail", "input": tc["input"],
                                       "expected": expected, "got": actual, "time_ms": result["time_ms"]})
@@ -790,7 +746,6 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
                 _summary_row(submission_id, language, "WA", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "WA", "test": n, "expected": expected, "got": actual, "test_results": test_results}
 
-            # ── Passed ────────────────────────────────────────────────────
             passed += 1
             display_rows.append({"n": n, "status": "pass", "input": tc["input"],
                                   "expected": expected, "got": actual, "time_ms": result["time_ms"]})
@@ -835,7 +790,7 @@ def save_verdict(submission_id: str, result: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# /execute endpoint (used by /run in the API — sample cases only)
+# /execute endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 
 run_api = Flask(__name__)
@@ -917,7 +872,6 @@ def start_worker():
         setup_db()
     sp.stop(ok=True, final_msg="PostgreSQL ready.")
 
-    # Verify seccomp profile on startup
     seccomp_path = os.path.abspath(SECCOMP_PROFILE_PATH)
     if os.path.exists(seccomp_path):
         _log("ok",   f"Seccomp profile  → {seccomp_path}")
