@@ -589,7 +589,7 @@ def run_test_in_docker(
             with open(input_path, "w") as f:
                  f.write(stdin_input)
 
-os.chmod(input_path, 0o666)
+            os.chmod(input_path, 0o666)
 
             return _run_container_blocking(
                 client, cfg["image"], cfg["exec_cmd"], tmp_dir,
