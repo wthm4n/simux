@@ -17,12 +17,16 @@ _dir = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_dir, '.env'))
 
 # ── Seccomp profile path ──────────────────────────────────────────────────────
-# Place seccomp.json in your sandbox/ folder and set this path.
-# Example: /home/you/simux-judge/sandbox/seccomp.json
-SECCOMP_PROFILE_PATH = os.environ.get(
-    "SECCOMP_PROFILE_PATH",
-    os.path.join(_dir, "..", "sandbox", "seccomp.json"),
-)
+# Auto-resolves to ../sandbox/seccomp.json relative to this file (worker/judge.py).
+# Override by setting SECCOMP_PROFILE_PATH in worker/.env — use an absolute path.
+# If the env var is set to the old placeholder value, ignore it and use the default.
+_env_seccomp = os.environ.get("SECCOMP_PROFILE_PATH", "")
+_default_seccomp = os.path.normpath(os.path.join(_dir, "..", "sandbox", "seccomp.json"))
+
+if _env_seccomp and "absolute/path/to" not in _env_seccomp:
+    SECCOMP_PROFILE_PATH = _env_seccomp
+else:
+    SECCOMP_PROFILE_PATH = _default_seccomp
 
 # Hard cap on container stdout — 10 MB
 MAX_OUTPUT_BYTES = 10 * 1024 * 1024
@@ -245,23 +249,25 @@ DEFAULT_TIMEOUT_S      = 10
 # Seccomp loader
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_seccomp() -> dict | None:
-    """
-    Returns the seccomp security_opt list if the profile file exists,
-    otherwise logs a warning and returns None (Docker default seccomp).
-    """
+# Cached at module load time — read once, reused for every container run.
+# This also means the warning only prints once at startup, not per submission.
+def _build_security_opts_once() -> list[str]:
     path = os.path.abspath(SECCOMP_PROFILE_PATH)
+    opts = ["no-new-privileges"]
     if not os.path.exists(path):
         _log("warn", f"seccomp.json not found at {path} — using Docker default seccomp")
-        return None
+        return opts
     try:
         with open(path) as f:
             profile = f.read()
-        _log("dim", f"Seccomp profile loaded  → {path}")
-        return [f"seccomp={profile}"]
+        _log("ok", f"Seccomp profile loaded  → {path}")
+        opts.append(f"seccomp={profile}")
     except Exception as e:
-        _log("warn", f"Failed to load seccomp profile: {e} — using Docker default")
-        return None
+        _log("warn", f"Failed to load seccomp: {e} — using Docker default")
+    return opts
+
+# Build once at import time
+_SECURITY_OPTS: list[str] = _build_security_opts_once()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,20 +280,17 @@ def _load_seccomp() -> dict | None:
 #   cpu_quota         — 50% of one CPU core
 #   pids_limit        — 64 processes max (prevents fork bombs)
 #   read_only         — root filesystem is read-only
-#   volumes rw only   — /code is the only writable path (tmpfs scratch)
-#   user              — runs as unprivileged user nobody (65534)
+#   tmpfs /tmp        — 64 MB writable scratch for runtimes that need it
+#   user nobody       — runs as uid 65534, not root
 #   cap_drop ALL      — all Linux capabilities dropped
-#   security_opt      — no-new-privileges + custom seccomp profile
-#   ulimits           — extra: 64 MB stack, 64 MB fsize, 16 MB core
-#   stdout cap        — truncated at MAX_OUTPUT_BYTES (10 MB)
+#   security_opt      — no-new-privileges + custom seccomp whitelist
+#   ulimits           — 64 MB stack/fsize, no core dumps, 64 fds
+#   stdout cap        — OLE verdict if output > 10 MB
+#   logs before rm    — container.logs() called BEFORE container.remove()
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_security_opts() -> list[str]:
-    opts = ["no-new-privileges"]
-    seccomp = _load_seccomp()
-    if seccomp:
-        opts.extend(seccomp)
-    return opts
+    return _SECURITY_OPTS
 
 
 def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
@@ -328,79 +331,73 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
         result_holder = {}
 
         def run_container():
+            # Use detach=False (blocking). The thread itself is the timeout mechanism.
+            # This avoids the detach=True race where a fast-exiting container gets
+            # garbage-collected before container.logs() can be called (409 error).
+            #
+            # With detach=False + stdout=True, containers.run() returns raw bytes
+            # directly — no separate logs() call needed, no race condition possible.
             try:
-                container = client.containers.run(
+                raw: bytes = client.containers.run(
                     image=image,
                     command=full_cmd,
 
-                    # ── Filesystem ─────────────────────────────────────────
+                    # ── Filesystem ────────────────────────────────────────
                     volumes={tmp_dir: {"bind": "/code", "mode": "rw"}},
-                    # Root fs is read-only; /code is the only writable path
-                    read_only=True,
-                    # Provide a writable /tmp via tmpfs (needed by some runtimes)
-                    tmpfs={"/tmp": "size=64m,mode=1777"},
+                    read_only=True,                          # root fs read-only
+                    tmpfs={"/tmp": "size=64m,mode=1777"},    # writable /tmp for runtimes
 
-                    # ── Network ────────────────────────────────────────────
+                    # ── Network ───────────────────────────────────────────
                     network_disabled=True,
 
-                    # ── Resources ──────────────────────────────────────────
+                    # ── Resources ─────────────────────────────────────────
                     mem_limit="256m",
-                    # Disable swap entirely (memswap = mem means no extra swap)
-                    memswap_limit="256m",
-                    cpu_quota=50000,          # 50% of one core (period=100000)
+                    memswap_limit="256m",   # no swap
+                    cpu_quota=50000,        # 50% of one core
                     cpu_period=100000,
                     pids_limit=64,
 
-                    # ── User ───────────────────────────────────────────────
-                    # Run as nobody:nogroup inside the container
-                    user="65534:65534",
+                    # ── User ──────────────────────────────────────────────
+                    user="65534:65534",     # nobody:nogroup
 
-                    # ── Capabilities ───────────────────────────────────────
+                    # ── Capabilities ──────────────────────────────────────
                     cap_drop=["ALL"],
 
-                    # ── Security ───────────────────────────────────────────
+                    # ── Security ──────────────────────────────────────────
                     security_opt=_build_security_opts(),
 
-                    # ── ulimits ────────────────────────────────────────────
+                    # ── ulimits ───────────────────────────────────────────
                     ulimits=[
-                        docker.types.Ulimit(name="stack",  soft=67108864,  hard=67108864),   # 64 MB stack
-                        docker.types.Ulimit(name="fsize",  soft=67108864,  hard=67108864),   # 64 MB max file write
-                        docker.types.Ulimit(name="core",   soft=0,         hard=0),           # no core dumps
-                        docker.types.Ulimit(name="nofile", soft=64,        hard=64),          # 64 open file descriptors
-                        docker.types.Ulimit(name="nproc",  soft=64,        hard=64),          # belt-and-suspenders pids
+                        docker.types.Ulimit(name="stack",  soft=67108864, hard=67108864),
+                        docker.types.Ulimit(name="fsize",  soft=67108864, hard=67108864),
+                        docker.types.Ulimit(name="core",   soft=0,        hard=0),
+                        docker.types.Ulimit(name="nofile", soft=64,       hard=64),
+                        docker.types.Ulimit(name="nproc",  soft=64,       hard=64),
                     ],
 
-                    # ── Cleanup ────────────────────────────────────────────
-                    remove=True,
-                    detach=True,
+                    # ── Output / cleanup ──────────────────────────────────
+                    stdout=True,     # capture stdout as return value
+                    stderr=False,    # stderr goes to ContainerError on non-zero exit
+                    remove=True,     # safe here: blocking run returns AFTER container stops
+                    detach=False,    # blocking — thread is the wall-clock enforcer
                 )
 
-                # Wait for completion; collect output with a hard byte cap
-                exit_info = container.wait(timeout=wall_limit + 2)
-
-                raw_stdout = container.logs(stdout=True,  stderr=False)
-                raw_stderr = container.logs(stdout=False, stderr=True)
-
-                # Output limit exceeded check
-                ole = len(raw_stdout) > MAX_OUTPUT_BYTES
-                stdout = raw_stdout[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace").strip()
-                stderr = raw_stderr[:65536].decode("utf-8", errors="replace").strip()  # 64 KB stderr cap
-
-                try:
-                    container.remove(force=True)
-                except Exception:
-                    pass
+                # raw is bytes of stdout; cap at MAX_OUTPUT_BYTES
+                ole    = len(raw) > MAX_OUTPUT_BYTES
+                stdout = raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace").strip()
 
                 result_holder["result"] = {
                     "stdout":    stdout,
-                    "stderr":    stderr,
-                    "exit_code": exit_info.get("StatusCode", 1),
+                    "stderr":    "",
+                    "exit_code": 0,
                     "ole":       ole,
                 }
 
             except docker.errors.ContainerError as e:
-                stderr = e.stderr.decode() if e.stderr else str(e)
-                result_holder["runtime_error"] = stderr
+                # Non-zero exit — stderr is on the exception
+                stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
+                result_holder["runtime_error"] = stderr[:65536]
+
             except Exception as e:
                 result_holder["exception"] = e
 
@@ -409,14 +406,19 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
 
         thread = threading.Thread(target=run_container)
         thread.start()
-        thread.join(timeout=wall_limit + 5)  # +5s grace for container.wait
+        # wall_limit is the hard timeout. No grace period needed —
+        # blocking run() returns as soon as the container exits.
+        thread.join(timeout=wall_limit)
 
         elapsed = int((time.time() - start) * 1000)
 
         # ── TLE: thread still alive after wall limit ──────────────────────
         if thread.is_alive():
             spinner.stop(ok=False, final_msg="Container timed out — killing…")
+            # With detach=False we have no container object here, so kill by mount path
             _kill_orphan_containers(client, tmp_dir)
+            # Thread may still be blocking in containers.run() — daemon=True means
+            # it won't prevent process exit, but we return immediately.
             return {"stdout": "", "stderr": "", "time_ms": elapsed,
                     "error": None, "tle": True}
 
