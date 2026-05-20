@@ -508,7 +508,9 @@ export default function Problem() {
       // poll verdict
       const poll = async () => {
         try {
-          const vRes = await axios.get(`${API}/verdict/${submissionId}`);
+          const vRes = await axios.get(`${API}/verdict/${submissionId}`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
           const v = vRes.data;
 
           // populate test case results if returned

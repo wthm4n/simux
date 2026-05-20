@@ -380,49 +380,34 @@ function AIGeneratorModal({ details, desc, onClose, onImport }) {
     setError('')
     setResult(null)
 
-    const prompt = `You are helping build test cases for a competitive programming judge.
-
-Problem: "${details.title}"
-Difficulty: ${details.difficulty}
-Time limit: ${details.time_limit}ms
-
-Description:
-${desc.description}
-
-${desc.input_format ? `Input Format:\n${desc.input_format}\n` : ''}
-${desc.output_format ? `Output Format:\n${desc.output_format}\n` : ''}
-${desc.constraints ? `Constraints:\n${desc.constraints}\n` : ''}
-
-Generate exactly ${count} test cases for this problem. Include:
-- 2 basic/trivial cases
-- Several small cases
-- Edge cases (minimum values, maximum values, zeros, negatives if applicable)
-- Corner cases specific to this problem type
-- Stress test cases near constraint limits
-
-Respond ONLY with a JSON array. No explanation, no markdown, no backticks. Format:
-[{"input": "...", "expected_output": "..."}, ...]
-
-Each input/output should be exactly what would be piped to stdin/stdout.`
+    const token = localStorage.getItem('token')
 
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
+      // API key stays server-side — call our own backend proxy
+      const res = await fetch(`${API}/ai/generate-testcases`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4000,
-          messages: [{ role: 'user', content: prompt }],
+          title:         details.title,
+          difficulty:    details.difficulty,
+          time_limit:    details.time_limit,
+          description:   desc.description,
+          input_format:  desc.input_format,
+          output_format: desc.output_format,
+          constraints:   desc.constraints,
+          count,
         }),
       })
       const data = await res.json()
-      const text = data.content?.map(b => b.text || '').join('') || ''
-      const clean = text.replace(/```json|```/g, '').trim()
-      const parsed = JSON.parse(clean)
-      if (!Array.isArray(parsed)) throw new Error('Not an array')
+      if (!res.ok) throw new Error(data.error || 'server error')
+      const parsed = data.test_cases
+      if (!Array.isArray(parsed)) throw new Error('Unexpected response format')
       setResult(parsed)
     } catch (e) {
-      setError('Failed to parse AI response. Try again or adjust the problem description.')
+      setError(e.message || 'Failed to generate test cases. Try again.')
     } finally {
       setLoading(false)
     }

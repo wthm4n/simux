@@ -97,8 +97,11 @@ export default function Verdict() {
   useEffect(() => {
     let interval;
     async function poll() {
+      const token = localStorage.getItem('token');
       try {
-        const res = await axios.get(`${API}/verdict/${id}`);
+        const res = await axios.get(`${API}/verdict/${id}`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
         setData(res.data);
         if (res.data.status === "done") {
           clearInterval(interval);
