@@ -390,8 +390,6 @@ def _run_container_blocking(
                 security_opt=_SECURITY_OPTS,
                 ulimits=_BASE_ULIMITS,
                 stdin_open=bool(stdin_data),  # only open stdin if we have input
-                stdout=True,
-                stderr=capture_stderr,
                 detach=True,
             )
 
