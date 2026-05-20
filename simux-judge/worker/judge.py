@@ -261,7 +261,7 @@ LANGUAGE_CONFIG = {
         "image":       "eclipse-temurin:21-jdk-alpine",
         "filename":    "Main.java",
         "compile_cmd": ["javac", "/code/Main.java"],
-        "exec_cmd":    ["java", "-cp", "/code", "-Xmx200m", "Main"],
+       "exec_cmd": ["sh", "-c", "java -cp /code -Xmx200m Main < /code/input.txt"],
     },
     "rust": {
         "image":       "rust:1.78-slim",
