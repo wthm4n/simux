@@ -97,6 +97,7 @@ VERDICT_META = {
     "WA":  {"label": "Wrong Answer",         "desc": "Output did not match expected output.",    "icon": "✖", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
     "TLE": {"label": "Time Limit Exceeded",  "desc": "Program took longer than the limit.",      "icon": "⧖", "color": C.BRIGHT_YELLOW,  "bg": C.BG_YELLOW},
     "RE":  {"label": "Runtime Error",        "desc": "Program crashed or exited non-zero.",      "icon": "⚡", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
+    "CE":  {"label": "Compile Error",        "desc": "Compilation failed — check your syntax.",  "icon": "⚒", "color": C.BRIGHT_YELLOW,  "bg": C.BG_YELLOW},
     "SE":  {"label": "System Error",         "desc": "Internal judge error — please resubmit.", "icon": "⚙", "color": C.BRIGHT_MAGENTA, "bg": C.BG_MAGENTA},
     "MLE": {"label": "Memory Limit Exceeded","desc": "Program exceeded memory limit.",           "icon": "◈", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
     "OLE": {"label": "Output Limit Exceeded","desc": "Program produced too much output.",        "icon": "◉", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
@@ -208,41 +209,56 @@ def setup_db():
 # ─────────────────────────────────────────────────────────────────────────────
 
 LANGUAGE_CONFIG = {
+    # ── Interpreted — no compile stage ───────────────────────────────────────
     "python": {
-        "image":    "python:3.11-slim",
-        "filename": "solution.py",
-        "run_cmd":  "python -u /code/solution.py < /code/input.txt",
-    },
-    "c": {
-        "image":    "gcc:13",
-        "filename": "solution.c",
-        "run_cmd":  "gcc /code/solution.c -o /code/solution -O2 -lm && /code/solution < /code/input.txt",
-    },
-    "cpp": {
-        "image":    "gcc:13",
-        "filename": "solution.cpp",
-        "run_cmd":  "g++ /code/solution.cpp -o /code/solution -O2 -std=c++17 && /code/solution < /code/input.txt",
-    },
-    "java": {
-        "image":    "eclipse-temurin:21-jdk-alpine",
-        "filename": "Main.java",
-        "run_cmd":  "javac /code/Main.java && java -cp /code -Xmx200m Main < /code/input.txt",
+        "image":       "python:3.11-slim",
+        "filename":    "solution.py",
+        "compile_cmd": None,                                      # syntax-check only
+        "syntax_cmd":  "python -m py_compile /code/solution.py",
+        "exec_cmd":    "python -u /code/solution.py < /code/input.txt",
     },
     "javascript": {
-        "image":    "node:20-slim",
-        "filename": "solution.js",
-        "run_cmd":  "node --max-old-space-size=200 /code/solution.js < /code/input.txt",
+        "image":       "node:20-slim",
+        "filename":    "solution.js",
+        "compile_cmd": None,
+        "syntax_cmd":  "node --check /code/solution.js",
+        "exec_cmd":    "node --max-old-space-size=200 /code/solution.js < /code/input.txt",
+    },
+
+    # ── Compiled ─────────────────────────────────────────────────────────────
+    "c": {
+        "image":       "gcc:13",
+        "filename":    "solution.c",
+        "compile_cmd": "gcc /code/solution.c -o /code/solution -O2 -lm 2>&1",
+        "syntax_cmd":  None,
+        "exec_cmd":    "/code/solution < /code/input.txt",
+    },
+    "cpp": {
+        "image":       "gcc:13",
+        "filename":    "solution.cpp",
+        "compile_cmd": "g++ /code/solution.cpp -o /code/solution -O2 -std=c++17 2>&1",
+        "syntax_cmd":  None,
+        "exec_cmd":    "/code/solution < /code/input.txt",
+    },
+    "java": {
+        "image":       "eclipse-temurin:21-jdk-alpine",
+        "filename":    "Main.java",
+        "compile_cmd": "javac /code/Main.java 2>&1",
+        "syntax_cmd":  None,
+        "exec_cmd":    "java -cp /code -Xmx200m Main < /code/input.txt",
     },
     "rust": {
-        "image":    "rust:1.78-slim",
-        "filename": "solution.rs",
-        "run_cmd":  "rustc /code/solution.rs -o /code/solution --edition 2021 && /code/solution < /code/input.txt",
+        "image":       "rust:1.78-slim",
+        "filename":    "solution.rs",
+        "compile_cmd": "rustc /code/solution.rs -o /code/solution --edition 2021 2>&1",
+        "syntax_cmd":  None,
+        "exec_cmd":    "/code/solution < /code/input.txt",
     },
 }
 
-SLOW_COMPILE_LANGUAGES = {"rust", "java"}
-COMPILE_TIMEOUT_S      = 30
-DEFAULT_TIMEOUT_S      = 10
+COMPILE_TIMEOUT_S  = 30   # wall-clock for the compile container
+SYNTAX_TIMEOUT_S   = 10   # wall-clock for interpreted syntax check
+DEFAULT_TIMEOUT_S  = 10   # wall-clock per test-case execution container
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,191 +309,238 @@ def _build_security_opts() -> list[str]:
     return _SECURITY_OPTS
 
 
+def _run_container_blocking(
+    client,
+    image:      str,
+    command:    str,
+    tmp_dir:    str,
+    wall_limit: int,
+    label:      str,
+    *,
+    # extra_ulimits lets callers add ulimits on top of the base set
+    extra_ulimits: list | None = None,
+) -> dict:
+    """
+    Shared low-level harness used by both compile_in_docker and run_in_docker.
+
+    Returns a dict with keys:
+        stdout   str   — captured stdout (capped at MAX_OUTPUT_BYTES)
+        stderr   str   — error text on non-zero exit, else ""
+        time_ms  int   — wall-clock ms from thread start to join
+        error    str|None — None | "runtime_error" | "system_error"
+        tle      bool
+        ole      bool
+        oom      bool  — True if Docker reports OOMKilled
+    """
+    result_holder: dict = {}
+    full_cmd = f'sh -c "{command}"'
+
+    base_ulimits = [
+        docker.types.Ulimit(name="stack",  soft=67108864, hard=67108864),
+        docker.types.Ulimit(name="fsize",  soft=67108864, hard=67108864),
+        docker.types.Ulimit(name="core",   soft=0,        hard=0),
+        docker.types.Ulimit(name="nofile", soft=64,       hard=64),
+        docker.types.Ulimit(name="nproc",  soft=64,       hard=64),
+    ]
+    ulimits = base_ulimits + (extra_ulimits or [])
+
+    def _run():
+        try:
+            raw: bytes = client.containers.run(
+                image=image,
+                command=full_cmd,
+                volumes={tmp_dir: {"bind": "/code", "mode": "rw"}},
+                read_only=True,
+                tmpfs={"/tmp": "size=64m,mode=1777"},
+                network_disabled=True,
+                mem_limit="256m",
+                memswap_limit="256m",
+                cpu_quota=50000,
+                cpu_period=100000,
+                pids_limit=64,
+                user="65534:65534",
+                cap_drop=["ALL"],
+                security_opt=_build_security_opts(),
+                ulimits=ulimits,
+                stdout=True,
+                stderr=False,
+                remove=True,
+                detach=False,
+            )
+            ole    = len(raw) > MAX_OUTPUT_BYTES
+            stdout = raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace").strip()
+            result_holder["result"] = {"stdout": stdout, "exit_code": 0, "ole": ole}
+
+        except docker.errors.ContainerError as e:
+            raw_err      = e.stderr if e.stderr else b""
+            stderr_clean = raw_err.decode("utf-8", errors="replace").strip()
+            if stderr_clean in ("Killed", "") and not stderr_clean.startswith("/"):
+                result_holder["ole"] = True
+            else:
+                result_holder["runtime_error"] = stderr_clean[:65536]
+
+        except Exception as exc:
+            result_holder["exception"] = exc
+
+    spinner = Spinner(label)
+    spinner.start()
+    t0     = time.time()
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=wall_limit)
+    elapsed = int((time.time() - t0) * 1000)
+
+    if thread.is_alive():
+        spinner.stop(ok=False, final_msg=f"Timed out after {wall_limit}s — killing…")
+        _kill_orphan_containers(client, tmp_dir)
+        return {"stdout": "", "stderr": "", "time_ms": elapsed,
+                "error": None, "tle": True, "ole": False, "oom": False}
+
+    if "exception" in result_holder:
+        spinner.stop(ok=False, final_msg="Unexpected exception.")
+        raise result_holder["exception"]
+
+    if result_holder.get("ole"):
+        spinner.stop(ok=False, final_msg=f"Output limit exceeded ({elapsed} ms)")
+        return {"stdout": "", "stderr": "Output limit exceeded", "time_ms": elapsed,
+                "error": None, "tle": False, "ole": True, "oom": False}
+
+    if "runtime_error" in result_holder:
+        stderr = result_holder["runtime_error"]
+        spinner.stop(ok=False, final_msg=f"Non-zero exit ({elapsed} ms)")
+        _log("error", f"stderr: {stderr[:200]}")
+        return {"stdout": "", "stderr": stderr, "time_ms": elapsed,
+                "error": "runtime_error", "tle": False, "ole": False, "oom": False}
+
+    r = result_holder.get("result", {})
+    if r.get("ole"):
+        spinner.stop(ok=False, final_msg=f"Output limit exceeded ({elapsed} ms)")
+        return {"stdout": "", "stderr": "Output limit exceeded (>10 MB)", "time_ms": elapsed,
+                "error": None, "tle": False, "ole": True, "oom": False}
+
+    spinner.stop(ok=True, final_msg=f"{label.split('(')[0].strip()} — {elapsed} ms")
+    return {
+        "stdout":  r.get("stdout", ""),
+        "stderr":  "",
+        "time_ms": elapsed,
+        "error":   None,
+        "tle":     False,
+        "ole":     False,
+        "oom":     False,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 — Compile
+#
+# Runs the compiler once per submission and writes the binary into tmp_dir.
+# Returns a verdict dict:
+#   {"ok": True}
+#   {"ok": False, "verdict": "CE", "stderr": "...compiler output..."}
+#   {"ok": False, "verdict": "SE", "stderr": "..."}
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compile_in_docker(language: str, tmp_dir: str) -> dict:
+    """
+    Compile the source already written into tmp_dir.
+    For interpreted languages this is a syntax check (fast, cheap).
+    For compiled languages this produces the binary consumed by run_in_docker.
+    """
+    cfg = LANGUAGE_CONFIG[language]
+    client = docker.from_env()
+
+    compile_cmd = cfg.get("compile_cmd")
+    syntax_cmd  = cfg.get("syntax_cmd")
+
+    # ── Interpreted: syntax check only ───────────────────────────────────────
+    if compile_cmd is None:
+        if syntax_cmd is None:
+            return {"ok": True}   # no check possible; trust the runtime
+        cmd        = syntax_cmd
+        wall_limit = SYNTAX_TIMEOUT_S
+        label      = f"Syntax check ({language}, wall: {wall_limit}s)…"
+    else:
+        cmd        = compile_cmd
+        wall_limit = COMPILE_TIMEOUT_S
+        label      = f"Compiling {language}  (wall: {wall_limit}s)…"
+
+    _log("info", label)
+
+    try:
+        result = _run_container_blocking(
+            client, cfg["image"], cmd, tmp_dir, wall_limit, label,
+        )
+    except Exception as e:
+        _log("error", f"Compile stage SE: {e}")
+        return {"ok": False, "verdict": "SE", "stderr": str(e)}
+
+    if result["tle"]:
+        return {"ok": False, "verdict": "CE",
+                "stderr": f"Compilation timed out after {wall_limit}s"}
+
+    if result["error"] == "runtime_error":
+        # Compiler exited non-zero → CE. stderr already decoded by harness.
+        # For compiled languages the compile_cmd redirects stderr to stdout
+        # (2>&1) so the error text is in result["stdout"].
+        compiler_output = result["stdout"] or result["stderr"]
+        _log("warn", f"CE: {compiler_output[:200]}")
+        return {"ok": False, "verdict": "CE", "stderr": compiler_output}
+
+    if result["error"] == "system_error":
+        return {"ok": False, "verdict": "SE", "stderr": result["stderr"]}
+
+    _log("ok", f"Compile OK  ({result['time_ms']} ms)")
+    return {"ok": True, "compile_ms": result["time_ms"]}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 — Execute one test case
+#
+# The binary / source is already in tmp_dir from Stage 1.
+# Timing starts HERE — compile time is NOT included.
+# ─────────────────────────────────────────────────────────────────────────────
+
 def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
+    """
+    Public API kept identical to the old signature so /execute endpoint
+    (used by /run) continues to work unchanged.
+
+    For /run (sample cases only) this is called without pre-compilation,
+    so we still do compile+run in sequence inside a single tmp_dir.
+    The judge() function bypasses this and calls compile_in_docker once
+    then run_test_in_docker per test case.
+    """
     cfg = LANGUAGE_CONFIG.get(language)
     if cfg is None:
         _log("error", f"Unsupported language: '{language}'")
         return {"stdout": "", "stderr": f"unsupported language: '{language}'",
                 "time_ms": 0, "error": "system_error"}
 
-    client     = docker.from_env()
-    image      = cfg["image"]
-    filename   = cfg["filename"]
-    run_cmd    = cfg["run_cmd"]
-    full_cmd   = f'sh -c "{run_cmd}"'
-    wall_limit = COMPILE_TIMEOUT_S if language in SLOW_COMPILE_LANGUAGES else DEFAULT_TIMEOUT_S
-    tmp_dir    = tempfile.mkdtemp()
-    start      = time.time()
-
-    # Make tmpdir world-writable so the container's nobody user (65534) can:
-    #   - read source + input files
-    #   - write the compiled binary back to /code/ (gcc/g++/rustc)
-    # We can't chown (worker runs unprivileged), so 0o777 is the right approach.
-    # The directory is deleted immediately after the run so this is safe.
+    tmp_dir = tempfile.mkdtemp()
     os.chmod(tmp_dir, 0o777)
 
     try:
-        src_path   = os.path.join(tmp_dir, filename)
+        src_path   = os.path.join(tmp_dir, cfg["filename"])
         input_path = os.path.join(tmp_dir, "input.txt")
 
-        with open(src_path, "w") as f:
-            f.write(code)
-        with open(input_path, "w") as f:
-            f.write(stdin_input)
-
-        # World-readable/writable so nobody (65534) can read and compile
+        with open(src_path,   "w") as f: f.write(code)
+        with open(input_path, "w") as f: f.write(stdin_input)
         os.chmod(src_path,   0o666)
         os.chmod(input_path, 0o666)
 
         _log("dim", f"Sandbox mount  → {tmp_dir}")
 
-        result_holder = {}
+        # ── Compile / syntax-check ────────────────────────────────────────
+        compile_result = compile_in_docker(language, tmp_dir)
+        if not compile_result["ok"]:
+            verdict = compile_result["verdict"]   # "CE" or "SE"
+            stderr  = compile_result["stderr"]
+            return {"stdout": "", "stderr": stderr, "time_ms": 0,
+                    "error": "compile_error" if verdict == "CE" else "system_error",
+                    "verdict": verdict}
 
-        def run_container():
-            # Use detach=False (blocking). The thread itself is the timeout mechanism.
-            # This avoids the detach=True race where a fast-exiting container gets
-            # garbage-collected before container.logs() can be called (409 error).
-            #
-            # With detach=False + stdout=True, containers.run() returns raw bytes
-            # directly — no separate logs() call needed, no race condition possible.
-            try:
-                raw: bytes = client.containers.run(
-                    image=image,
-                    command=full_cmd,
-
-                    # ── Filesystem ────────────────────────────────────────
-                    volumes={tmp_dir: {"bind": "/code", "mode": "rw"}},
-                    read_only=True,                          # root fs read-only
-                    tmpfs={"/tmp": "size=64m,mode=1777"},    # writable /tmp for runtimes
-
-                    # ── Network ───────────────────────────────────────────
-                    network_disabled=True,
-
-                    # ── Resources ─────────────────────────────────────────
-                    mem_limit="256m",
-                    memswap_limit="256m",   # no swap
-                    cpu_quota=50000,        # 50% of one core
-                    cpu_period=100000,
-                    pids_limit=64,
-
-                    # ── User ──────────────────────────────────────────────
-                    user="65534:65534",     # nobody:nogroup
-
-                    # ── Capabilities ──────────────────────────────────────
-                    cap_drop=["ALL"],
-
-                    # ── Security ──────────────────────────────────────────
-                    security_opt=_build_security_opts(),
-
-                    # ── ulimits ───────────────────────────────────────────
-                    ulimits=[
-                        docker.types.Ulimit(name="stack",  soft=67108864, hard=67108864),
-                        docker.types.Ulimit(name="fsize",  soft=67108864, hard=67108864),
-                        docker.types.Ulimit(name="core",   soft=0,        hard=0),
-                        docker.types.Ulimit(name="nofile", soft=64,       hard=64),
-                        docker.types.Ulimit(name="nproc",  soft=64,       hard=64),
-                    ],
-
-                    # ── Output / cleanup ──────────────────────────────────
-                    stdout=True,     # capture stdout as return value
-                    stderr=False,    # stderr goes to ContainerError on non-zero exit
-                    remove=True,     # safe here: blocking run returns AFTER container stops
-                    detach=False,    # blocking — thread is the wall-clock enforcer
-                )
-
-                # raw is bytes of stdout; cap at MAX_OUTPUT_BYTES
-                ole    = len(raw) > MAX_OUTPUT_BYTES
-                stdout = raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace").strip()
-
-                result_holder["result"] = {
-                    "stdout":    stdout,
-                    "stderr":    "",
-                    "exit_code": 0,
-                    "ole":       ole,
-                }
-
-            except docker.errors.ContainerError as e:
-                # Non-zero exit — stderr is on the exception
-                raw_err = e.stderr if e.stderr else b""
-                stderr  = raw_err.decode("utf-8", errors="replace")
-
-                # "Killed" with no other message = process was killed by the kernel
-                # due to a resource limit (fsize ulimit → too much output, or OOM).
-                # Treat as OLE if the stdout we captured so far is suspiciously large,
-                # or if stderr is literally just "Killed".
-                stderr_clean = stderr.strip()
-                if stderr_clean in ("Killed", "") and not stderr_clean.startswith("/"):
-                    result_holder["ole"] = True
-                else:
-                    result_holder["runtime_error"] = stderr_clean[:65536]
-
-            except Exception as e:
-                result_holder["exception"] = e
-
-        spinner = Spinner(f"Running {language} sandbox  (wall-clock: {wall_limit}s)…")
-        spinner.start()
-
-        thread = threading.Thread(target=run_container)
-        thread.start()
-        # wall_limit is the hard timeout. No grace period needed —
-        # blocking run() returns as soon as the container exits.
-        thread.join(timeout=wall_limit)
-
-        elapsed = int((time.time() - start) * 1000)
-
-        # ── TLE: thread still alive after wall limit ──────────────────────
-        if thread.is_alive():
-            spinner.stop(ok=False, final_msg="Container timed out — killing…")
-            # With detach=False we have no container object here, so kill by mount path
-            _kill_orphan_containers(client, tmp_dir)
-            # Thread may still be blocking in containers.run() — daemon=True means
-            # it won't prevent process exit, but we return immediately.
-            return {"stdout": "", "stderr": "", "time_ms": elapsed,
-                    "error": None, "tle": True}
-
-        # ── Unexpected exception ──────────────────────────────────────────
-        if "exception" in result_holder:
-            spinner.stop(ok=False, final_msg="Unexpected exception.")
-            raise result_holder["exception"]
-
-        # ── OLE from ContainerError path (fsize/oom kill) ─────────────────
-        if result_holder.get("ole"):
-            spinner.stop(ok=False, final_msg=f"Output limit exceeded ({elapsed} ms)")
-            return {"stdout": "", "stderr": "Output limit exceeded", "time_ms": elapsed,
-                    "error": None, "ole": True}
-
-        # ── Runtime error (ContainerError) ───────────────────────────────
-        if "runtime_error" in result_holder:
-            stderr = result_holder["runtime_error"]
-            spinner.stop(ok=False, final_msg=f"Container exited with error ({elapsed} ms)")
-            _log("error", f"stderr: {stderr[:200]}")
-            return {"stdout": "", "stderr": stderr, "time_ms": elapsed,
-                    "error": "runtime_error"}
-
-        # ── Normal completion ─────────────────────────────────────────────
-        r = result_holder.get("result", {})
-
-        if r.get("ole"):
-            spinner.stop(ok=False, final_msg=f"Output limit exceeded ({elapsed} ms)")
-            return {"stdout": "", "stderr": "Output limit exceeded (>10 MB)", "time_ms": elapsed,
-                    "error": None, "ole": True}
-
-        # Non-zero exit code = runtime error
-        if r.get("exit_code", 0) != 0 and not r.get("stdout"):
-            spinner.stop(ok=False, final_msg=f"Non-zero exit code ({elapsed} ms)")
-            return {"stdout": r.get("stdout",""), "stderr": r.get("stderr",""),
-                    "time_ms": elapsed, "error": "runtime_error"}
-
-        spinner.stop(ok=True, final_msg=f"Container finished in {elapsed} ms")
-        _log("dim", f"stdout preview → {repr(r.get('stdout','')[:80])}")
-
-        return {
-            "stdout":  r.get("stdout", ""),
-            "stderr":  r.get("stderr", ""),
-            "time_ms": elapsed,
-            "error":   None,
-            "tle":     False,
-        }
+        # ── Execute ───────────────────────────────────────────────────────
+        return run_test_in_docker(language, tmp_dir, stdin_input, auto_cleanup=False)
 
     except Exception as e:
         _log("error", f"SYSTEM ERROR  {type(e).__name__}: {e}")
@@ -485,6 +548,46 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def run_test_in_docker(
+    language:     str,
+    tmp_dir:      str,
+    stdin_input:  str = "",
+    *,
+    time_limit_ms: int  = 0,     # 0 = use DEFAULT_TIMEOUT_S
+    auto_cleanup: bool  = True,  # set False when caller owns tmp_dir lifetime
+) -> dict:
+    """
+    Execute the already-compiled binary / source for one test case.
+    tmp_dir must already contain the compiled artifact and will receive input.txt.
+    Timing is wall-clock of this container ONLY — no compile time.
+    """
+    cfg        = LANGUAGE_CONFIG[language]
+    client     = docker.from_env()
+    exec_cmd   = cfg["exec_cmd"]
+    wall_limit = (time_limit_ms // 1000 + 2) if time_limit_ms else DEFAULT_TIMEOUT_S
+
+    try:
+        input_path = os.path.join(tmp_dir, "input.txt")
+        with open(input_path, "w") as f:
+            f.write(stdin_input)
+        os.chmod(input_path, 0o666)
+
+        label  = f"Executing {language}  (wall: {wall_limit}s)…"
+        result = _run_container_blocking(
+            client, cfg["image"], exec_cmd, tmp_dir, wall_limit, label,
+        )
+        return result
+
+    except Exception as e:
+        _log("error", f"SYSTEM ERROR run_test  {type(e).__name__}: {e}")
+        return {"stdout": "", "stderr": str(e), "time_ms": 0,
+                "error": "system_error", "tle": False, "ole": False, "oom": False}
+
+    finally:
+        if auto_cleanup:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _kill_orphan_containers(client, tmp_dir: str):
@@ -510,10 +613,10 @@ def _kill_orphan_containers(client, tmp_dir: str):
 def judge(submission_id: str, language: str, code: str, test_cases: list) -> dict:
     _section(f"Judging  {submission_id}  ({language})", "◈")
 
-    result       = {}
     display_rows = []
     test_results = []
     passed       = 0
+    result       = {}   # last test result, used for final time_ms
 
     def _skip_remaining(from_idx: int, verdict_code: str):
         for j in range(from_idx, len(test_cases)):
@@ -529,91 +632,146 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
                 "is_sample": test_cases[j].get("is_sample", False),
             })
 
-    for i, tc in enumerate(test_cases):
-        n         = i + 1
-        result    = run_in_docker(language, code, tc["input"])
-        is_sample = tc.get("is_sample", False)
+    # ── Stage 1: Compile once ─────────────────────────────────────────────────
+    # Source lands in tmp_dir; compiled binary stays there for all test cases.
+    cfg     = LANGUAGE_CONFIG.get(language)
+    if cfg is None:
+        _log("error", f"Unsupported language: '{language}'")
+        return {"verdict": "SE", "time_ms": 0, "test_results": []}
 
-        # ── Output Limit Exceeded ─────────────────────────────────────────
-        if result.get("ole"):
-            display_rows.append({"n": n, "status": "ole", "input": tc["input"],
-                                  "expected": tc.get("expected_output",""), "got": "[truncated]", "time_ms": result["time_ms"]})
-            test_results.append({"n": n, "passed": False, "verdict": "OLE",
-                                  "time_ms": result["time_ms"], "actual_output": "", "stderr": "Output limit exceeded",
-                                  "is_sample": is_sample})
-            _skip_remaining(i+1, "OLE")
-            _test_table(display_rows); _verdict_banner("OLE")
-            _summary_row(submission_id, language, "OLE", passed, len(test_cases), result["time_ms"])
-            return {"verdict": "OLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
+    tmp_dir  = tempfile.mkdtemp()
+    os.chmod(tmp_dir, 0o777)
 
-        # ── TLE (wall-clock) ─────────────────────────────────────────────
-        if result.get("tle"):
-            display_rows.append({"n": n, "status": "tle", "input": tc["input"],
-                                  "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
-            test_results.append({"n": n, "passed": False, "verdict": "TLE",
-                                  "time_ms": result["time_ms"], "actual_output": "", "stderr": "",
-                                  "is_sample": is_sample})
-            _skip_remaining(i+1, "TLE")
-            _test_table(display_rows); _verdict_banner("TLE")
-            _summary_row(submission_id, language, "TLE", passed, len(test_cases), result["time_ms"])
-            return {"verdict": "TLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
+    src_path = os.path.join(tmp_dir, cfg["filename"])
+    with open(src_path, "w") as f:
+        f.write(code)
+    os.chmod(src_path, 0o666)
 
-        # ── System error ─────────────────────────────────────────────────
-        if result["error"] == "system_error":
-            _log("error", f"System error on test #{n}: {result['stderr'][:200]}")
-            _verdict_banner("SE")
-            test_results.append({"n": n, "passed": False, "verdict": "SE",
-                                  "time_ms": 0, "actual_output": "", "stderr": result.get("stderr",""),
-                                  "is_sample": is_sample})
-            return {"verdict": "SE", "detail": result["stderr"], "test_results": test_results}
+    compile_result = compile_in_docker(language, tmp_dir)
 
-        # ── Runtime error ─────────────────────────────────────────────────
-        if result["error"] == "runtime_error":
-            display_rows.append({"n": n, "status": "error", "input": tc["input"],
-                                  "expected": tc.get("expected_output",""), "got": "—",
-                                  "time_ms": result["time_ms"], "stderr": result["stderr"]})
-            test_results.append({"n": n, "passed": False, "verdict": "RE",
-                                  "time_ms": result["time_ms"], "actual_output": "",
-                                  "stderr": result.get("stderr",""), "is_sample": is_sample})
-            _skip_remaining(i+1, "RE")
-            _test_table(display_rows); _verdict_banner("RE")
-            _summary_row(submission_id, language, "RE", passed, len(test_cases), result["time_ms"])
-            return {"verdict": "RE", "detail": result["stderr"], "test": n, "test_results": test_results}
+    if not compile_result["ok"]:
+        verdict = compile_result["verdict"]   # "CE" or "SE"
+        stderr  = compile_result["stderr"]
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        for j, tc in enumerate(test_cases):
+            test_results.append({
+                "n": j+1, "passed": False, "verdict": verdict,
+                "time_ms": 0, "actual_output": "", "stderr": stderr,
+                "is_sample": tc.get("is_sample", False),
+            })
+        _verdict_banner(verdict)
+        _log("warn" if verdict == "CE" else "error", f"{verdict}: {stderr[:300]}")
+        _summary_row(submission_id, language, verdict, 0, len(test_cases), 0)
+        return {"verdict": verdict, "stderr": stderr, "time_ms": 0,
+                "test_results": test_results}
 
-        # ── Runtime TLE (time_ms exceeds limit) ───────────────────────────
-        if result["time_ms"] > 2000:
-            display_rows.append({"n": n, "status": "tle", "input": tc["input"],
-                                  "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
-            test_results.append({"n": n, "passed": False, "verdict": "TLE",
-                                  "time_ms": result["time_ms"], "actual_output": "", "stderr": "",
-                                  "is_sample": is_sample})
-            _skip_remaining(i+1, "TLE")
-            _test_table(display_rows); _verdict_banner("TLE")
-            _summary_row(submission_id, language, "TLE", passed, len(test_cases), result["time_ms"])
-            return {"verdict": "TLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
+    compile_ms = compile_result.get("compile_ms", 0)
+    _log("ok", f"Compiled in {compile_ms} ms — running {len(test_cases)} test case(s)")
 
-        expected = tc["expected_output"].strip()
-        actual   = result["stdout"].strip()
+    # ── Stage 2: Execute each test case ──────────────────────────────────────
+    try:
+        for i, tc in enumerate(test_cases):
+            n         = i + 1
+            result    = run_test_in_docker(language, tmp_dir, tc["input"],
+                                           auto_cleanup=False)
+            is_sample = tc.get("is_sample", False)
 
-        # ── Wrong answer ──────────────────────────────────────────────────
-        if actual != expected:
-            display_rows.append({"n": n, "status": "fail", "input": tc["input"],
+            # ── Output Limit Exceeded ─────────────────────────────────────
+            if result.get("ole"):
+                display_rows.append({"n": n, "status": "ole", "input": tc["input"],
+                                      "expected": tc.get("expected_output",""), "got": "[truncated]", "time_ms": result["time_ms"]})
+                test_results.append({"n": n, "passed": False, "verdict": "OLE",
+                                      "time_ms": result["time_ms"], "actual_output": "", "stderr": "Output limit exceeded",
+                                      "is_sample": is_sample})
+                _skip_remaining(i+1, "OLE")
+                _test_table(display_rows); _verdict_banner("OLE")
+                _summary_row(submission_id, language, "OLE", passed, len(test_cases), result["time_ms"])
+                return {"verdict": "OLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
+
+            # ── TLE (wall-clock timeout) ──────────────────────────────────
+            if result.get("tle"):
+                display_rows.append({"n": n, "status": "tle", "input": tc["input"],
+                                      "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
+                test_results.append({"n": n, "passed": False, "verdict": "TLE",
+                                      "time_ms": result["time_ms"], "actual_output": "", "stderr": "",
+                                      "is_sample": is_sample})
+                _skip_remaining(i+1, "TLE")
+                _test_table(display_rows); _verdict_banner("TLE")
+                _summary_row(submission_id, language, "TLE", passed, len(test_cases), result["time_ms"])
+                return {"verdict": "TLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
+
+            # ── OOM killed → MLE ──────────────────────────────────────────
+            if result.get("oom"):
+                display_rows.append({"n": n, "status": "error", "input": tc["input"],
+                                      "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
+                test_results.append({"n": n, "passed": False, "verdict": "MLE",
+                                      "time_ms": result["time_ms"], "actual_output": "",
+                                      "stderr": "Memory limit exceeded", "is_sample": is_sample})
+                _skip_remaining(i+1, "MLE")
+                _test_table(display_rows); _verdict_banner("MLE")
+                _summary_row(submission_id, language, "MLE", passed, len(test_cases), result["time_ms"])
+                return {"verdict": "MLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
+
+            # ── System error ──────────────────────────────────────────────
+            if result.get("error") == "system_error":
+                _log("error", f"System error on test #{n}: {result['stderr'][:200]}")
+                _verdict_banner("SE")
+                test_results.append({"n": n, "passed": False, "verdict": "SE",
+                                      "time_ms": 0, "actual_output": "", "stderr": result.get("stderr",""),
+                                      "is_sample": is_sample})
+                return {"verdict": "SE", "detail": result["stderr"], "test_results": test_results}
+
+            # ── Runtime error ─────────────────────────────────────────────
+            if result.get("error") == "runtime_error":
+                display_rows.append({"n": n, "status": "error", "input": tc["input"],
+                                      "expected": tc.get("expected_output",""), "got": "—",
+                                      "time_ms": result["time_ms"], "stderr": result["stderr"]})
+                test_results.append({"n": n, "passed": False, "verdict": "RE",
+                                      "time_ms": result["time_ms"], "actual_output": "",
+                                      "stderr": result.get("stderr",""), "is_sample": is_sample})
+                _skip_remaining(i+1, "RE")
+                _test_table(display_rows); _verdict_banner("RE")
+                _summary_row(submission_id, language, "RE", passed, len(test_cases), result["time_ms"])
+                return {"verdict": "RE", "detail": result["stderr"], "test": n, "test_results": test_results}
+
+            # ── Runtime TLE (execution time_ms exceeds problem limit) ─────
+            # DEFAULT_TIMEOUT_S is the hard wall; this catches soft per-problem limits.
+            if result["time_ms"] > 2000:
+                display_rows.append({"n": n, "status": "tle", "input": tc["input"],
+                                      "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
+                test_results.append({"n": n, "passed": False, "verdict": "TLE",
+                                      "time_ms": result["time_ms"], "actual_output": "", "stderr": "",
+                                      "is_sample": is_sample})
+                _skip_remaining(i+1, "TLE")
+                _test_table(display_rows); _verdict_banner("TLE")
+                _summary_row(submission_id, language, "TLE", passed, len(test_cases), result["time_ms"])
+                return {"verdict": "TLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
+
+            expected = tc["expected_output"].strip()
+            actual   = result["stdout"].strip()
+
+            # ── Wrong answer ──────────────────────────────────────────────
+            if actual != expected:
+                display_rows.append({"n": n, "status": "fail", "input": tc["input"],
+                                      "expected": expected, "got": actual, "time_ms": result["time_ms"]})
+                test_results.append({"n": n, "passed": False, "verdict": "WA",
+                                      "time_ms": result["time_ms"], "actual_output": actual,
+                                      "stderr": "", "is_sample": is_sample})
+                _skip_remaining(i+1, "WA")
+                _test_table(display_rows); _verdict_banner("WA")
+                _summary_row(submission_id, language, "WA", passed, len(test_cases), result["time_ms"])
+                return {"verdict": "WA", "test": n, "expected": expected, "got": actual, "test_results": test_results}
+
+            # ── Passed ────────────────────────────────────────────────────
+            passed += 1
+            display_rows.append({"n": n, "status": "pass", "input": tc["input"],
                                   "expected": expected, "got": actual, "time_ms": result["time_ms"]})
-            test_results.append({"n": n, "passed": False, "verdict": "WA",
+            test_results.append({"n": n, "passed": True, "verdict": "AC",
                                   "time_ms": result["time_ms"], "actual_output": actual,
                                   "stderr": "", "is_sample": is_sample})
-            _skip_remaining(i+1, "WA")
-            _test_table(display_rows); _verdict_banner("WA")
-            _summary_row(submission_id, language, "WA", passed, len(test_cases), result["time_ms"])
-            return {"verdict": "WA", "test": n, "expected": expected, "got": actual, "test_results": test_results}
 
-        # ── Passed ────────────────────────────────────────────────────────
-        passed += 1
-        display_rows.append({"n": n, "status": "pass", "input": tc["input"],
-                              "expected": expected, "got": actual, "time_ms": result["time_ms"]})
-        test_results.append({"n": n, "passed": True, "verdict": "AC",
-                              "time_ms": result["time_ms"], "actual_output": actual,
-                              "stderr": "", "is_sample": is_sample})
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     _test_table(display_rows); _verdict_banner("AC")
     _summary_row(submission_id, language, "AC", passed, len(test_cases), result.get("time_ms", 0))
