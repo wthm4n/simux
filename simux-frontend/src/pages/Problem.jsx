@@ -3,7 +3,7 @@ import { useParams, useNavigate } from "react-router-dom";
 import Editor from "@monaco-editor/react";
 import axios from "axios";
 
-const API = "http://localhost:3000";
+const API = import.meta.env.VITE_API_URL
 
 const LANGS = ["python", "cpp", "c", "java", "javascript", "rust"];
 
