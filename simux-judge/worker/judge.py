@@ -359,7 +359,6 @@ def _run_container_blocking(
                 image=image,
                 command=command,
                 volumes={tmp_dir: {"bind": "/code", "mode": "rw"}},
-                read_only=True,
                 tmpfs={"/tmp": "size=64m,mode=1777"},
                 network_disabled=True,
                 mem_limit="256m",
@@ -566,6 +565,7 @@ def run_test_in_docker(
                 client, cfg["image"], cfg["exec_cmd"], tmp_dir,
                 "",             # stdin_data unused; input.txt used instead
                 wall_limit, label, language,
+                capture_stderr=True,
             )
     except Exception as e:
         _log("error", f"SYSTEM ERROR run_test  {type(e).__name__}: {e}")
