@@ -255,7 +255,7 @@ LANGUAGE_CONFIG = {
         "image":       "gcc:13",
         "filename":    "solution.cpp",
         "compile_cmd": ["g++", "/code/solution.cpp", "-o", "/code/solution", "-O2", "-std=c++17"],
-        "exec_cmd":    ["/code/solution"],
+        "exec_cmd": ["sh", "-c", "/code/solution < /code/input.txt"],
     },
     "java": {
         "image":       "eclipse-temurin:21-jdk-alpine",
