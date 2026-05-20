@@ -584,7 +584,7 @@ def run_test_in_docker(
     try:
         with _judge_sem:
 
-input_path = os.path.join(tmp_dir, "input.txt")
+            input_path = os.path.join(tmp_dir, "input.txt")
 
 with open(input_path, "w") as f:
     f.write(stdin_input)
