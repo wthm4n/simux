@@ -209,55 +209,51 @@ def setup_db():
 # ─────────────────────────────────────────────────────────────────────────────
 
 LANGUAGE_CONFIG = {
-    # ── Interpreted — no compile stage ───────────────────────────────────────
+    # ── Interpreted — no compile stage, no syntax-check container.
+    #    Syntax errors surface as RE with a readable traceback from the runtime.
+    #    A separate py_compile / node --check container costs a full spawn for
+    #    zero benefit over letting the runtime reject it on the first test case.
     "python": {
         "image":       "python:3.11-slim",
         "filename":    "solution.py",
-        "compile_cmd": None,                                      # syntax-check only
-        "syntax_cmd":  "python -m py_compile /code/solution.py",
+        "compile_cmd": None,
         "exec_cmd":    "python -u /code/solution.py < /code/input.txt",
     },
     "javascript": {
         "image":       "node:20-slim",
         "filename":    "solution.js",
         "compile_cmd": None,
-        "syntax_cmd":  "node --check /code/solution.js",
         "exec_cmd":    "node --max-old-space-size=200 /code/solution.js < /code/input.txt",
     },
 
-    # ── Compiled ─────────────────────────────────────────────────────────────
+    # ── Compiled — compile_cmd runs once; exec_cmd runs per test case. ────────
     "c": {
         "image":       "gcc:13",
         "filename":    "solution.c",
         "compile_cmd": "gcc /code/solution.c -o /code/solution -O2 -lm 2>&1",
-        "syntax_cmd":  None,
         "exec_cmd":    "/code/solution < /code/input.txt",
     },
     "cpp": {
         "image":       "gcc:13",
         "filename":    "solution.cpp",
         "compile_cmd": "g++ /code/solution.cpp -o /code/solution -O2 -std=c++17 2>&1",
-        "syntax_cmd":  None,
         "exec_cmd":    "/code/solution < /code/input.txt",
     },
     "java": {
         "image":       "eclipse-temurin:21-jdk-alpine",
         "filename":    "Main.java",
         "compile_cmd": "javac /code/Main.java 2>&1",
-        "syntax_cmd":  None,
         "exec_cmd":    "java -cp /code -Xmx200m Main < /code/input.txt",
     },
     "rust": {
         "image":       "rust:1.78-slim",
         "filename":    "solution.rs",
         "compile_cmd": "rustc /code/solution.rs -o /code/solution --edition 2021 2>&1",
-        "syntax_cmd":  None,
         "exec_cmd":    "/code/solution < /code/input.txt",
     },
 }
 
 COMPILE_TIMEOUT_S  = 30   # wall-clock for the compile container
-SYNTAX_TIMEOUT_S   = 10   # wall-clock for interpreted syntax check
 DEFAULT_TIMEOUT_S  = 10   # wall-clock per test-case execution container
 
 
@@ -443,32 +439,25 @@ def _run_container_blocking(
 def compile_in_docker(language: str, tmp_dir: str) -> dict:
     """
     Compile the source already written into tmp_dir.
-    For interpreted languages this is a syntax check (fast, cheap).
-    For compiled languages this produces the binary consumed by run_in_docker.
+    Interpreted languages (compile_cmd=None) skip this entirely — returns ok immediately.
+    For compiled languages this produces the binary consumed by run_test_in_docker.
     """
-    cfg = LANGUAGE_CONFIG[language]
-    client = docker.from_env()
-
+    cfg         = LANGUAGE_CONFIG[language]
     compile_cmd = cfg.get("compile_cmd")
-    syntax_cmd  = cfg.get("syntax_cmd")
 
-    # ── Interpreted: syntax check only ───────────────────────────────────────
+    # ── Interpreted: nothing to compile, skip ────────────────────────────────
     if compile_cmd is None:
-        if syntax_cmd is None:
-            return {"ok": True}   # no check possible; trust the runtime
-        cmd        = syntax_cmd
-        wall_limit = SYNTAX_TIMEOUT_S
-        label      = f"Syntax check ({language}, wall: {wall_limit}s)…"
-    else:
-        cmd        = compile_cmd
-        wall_limit = COMPILE_TIMEOUT_S
-        label      = f"Compiling {language}  (wall: {wall_limit}s)…"
+        return {"ok": True, "compile_ms": 0}
 
+    # ── Compiled: run the compiler once ──────────────────────────────────────
+    client     = docker.from_env()
+    wall_limit = COMPILE_TIMEOUT_S
+    label      = f"Compiling {language}  (wall: {wall_limit}s)…"
     _log("info", label)
 
     try:
         result = _run_container_blocking(
-            client, cfg["image"], cmd, tmp_dir, wall_limit, label,
+            client, cfg["image"], compile_cmd, tmp_dir, wall_limit, label,
         )
     except Exception as e:
         _log("error", f"Compile stage SE: {e}")
@@ -479,9 +468,8 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
                 "stderr": f"Compilation timed out after {wall_limit}s"}
 
     if result["error"] == "runtime_error":
-        # Compiler exited non-zero → CE. stderr already decoded by harness.
-        # For compiled languages the compile_cmd redirects stderr to stdout
-        # (2>&1) so the error text is in result["stdout"].
+        # Compiler exited non-zero → CE.
+        # compile_cmd uses 2>&1 so compiler error text is in stdout.
         compiler_output = result["stdout"] or result["stderr"]
         _log("warn", f"CE: {compiler_output[:200]}")
         return {"ok": False, "verdict": "CE", "stderr": compiler_output}
@@ -489,7 +477,7 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
     if result["error"] == "system_error":
         return {"ok": False, "verdict": "SE", "stderr": result["stderr"]}
 
-    _log("ok", f"Compile OK  ({result['time_ms']} ms)")
+    _log("ok", f"Compiled in {result['time_ms']} ms")
     return {"ok": True, "compile_ms": result["time_ms"]}
 
 
