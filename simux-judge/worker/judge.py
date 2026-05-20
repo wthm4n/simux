@@ -267,7 +267,7 @@ LANGUAGE_CONFIG = {
         "image":       "rust:1.78-slim",
         "filename":    "solution.rs",
         "compile_cmd": ["rustc", "/code/solution.rs", "-o", "/code/solution", "--edition", "2021"],
-        "exec_cmd":    ["/code/solution"],
+        "exec_cmd": ["sh", "-c", "/code/solution < /code/input.txt"],
     },
 }
 
