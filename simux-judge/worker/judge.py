@@ -981,5 +981,3 @@ def start_worker():
 
 if __name__ == "__main__":
     start_worker()
-ENDOFFILE
-echo "wrote $(wc -l < /home/claude/judge.py) lines"
