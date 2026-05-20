@@ -242,7 +242,7 @@ LANGUAGE_CONFIG = {
         "image":       "node:20-slim",
         "filename":    "solution.js",
         "compile_cmd": None,
-        "exec_cmd":    ["node", "--max-old-space-size=200", "/code/solution.js"],
+        "exec_cmd": ["sh", "-c", "node --max-old-space-size=200 /code/solution.js < /code/input.txt"],
     },
     "c": {
         "image":       "gcc:13",
