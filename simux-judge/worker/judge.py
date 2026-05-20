@@ -309,12 +309,12 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
     tmp_dir    = tempfile.mkdtemp()
     start      = time.time()
 
-    # chown the tmpdir to nobody:nogroup (65534) so the container user can:
+    # Make tmpdir world-writable so the container's nobody user (65534) can:
     #   - read source + input files
-    #   - write the compiled binary (gcc/g++/rustc output goes to /code/)
-    # Without this, compiled languages fail with "Permission denied" on link.
-    os.chown(tmp_dir, 65534, 65534)
-    os.chmod(tmp_dir, 0o755)
+    #   - write the compiled binary back to /code/ (gcc/g++/rustc)
+    # We can't chown (worker runs unprivileged), so 0o777 is the right approach.
+    # The directory is deleted immediately after the run so this is safe.
+    os.chmod(tmp_dir, 0o777)
 
     try:
         src_path   = os.path.join(tmp_dir, filename)
@@ -325,11 +325,9 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
         with open(input_path, "w") as f:
             f.write(stdin_input)
 
-        # Own + readable by nobody (65534)
-        os.chown(src_path,   65534, 65534)
-        os.chown(input_path, 65534, 65534)
-        os.chmod(src_path,   0o644)
-        os.chmod(input_path, 0o644)
+        # World-readable/writable so nobody (65534) can read and compile
+        os.chmod(src_path,   0o666)
+        os.chmod(input_path, 0o666)
 
         _log("dim", f"Sandbox mount  → {tmp_dir}")
 
