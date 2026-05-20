@@ -9,6 +9,7 @@ import shutil
 import threading
 import sys
 import itertools
+from threading import Semaphore
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -16,56 +17,44 @@ from dotenv import load_dotenv
 _dir = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_dir, '.env'))
 
-# ── Seccomp profile path ──────────────────────────────────────────────────────
-_env_seccomp = os.environ.get("SECCOMP_PROFILE_PATH", "")
+# ── Seccomp profile ───────────────────────────────────────────────────────────
+_env_seccomp  = os.environ.get("SECCOMP_PROFILE_PATH", "")
 _default_seccomp = os.path.normpath(os.path.join(_dir, "..", "sandbox", "seccomp.json"))
+SECCOMP_PROFILE_PATH = (
+    _env_seccomp if _env_seccomp and "absolute/path/to" not in _env_seccomp
+    else _default_seccomp
+)
 
-if _env_seccomp and "absolute/path/to" not in _env_seccomp:
-    SECCOMP_PROFILE_PATH = _env_seccomp
-else:
-    SECCOMP_PROFILE_PATH = _default_seccomp
+MAX_OUTPUT_BYTES = 10 * 1024 * 1024   # 10 MB stdout cap
 
-# Hard cap on container stdout — 10 MB
-MAX_OUTPUT_BYTES = 10 * 1024 * 1024
+# ── Concurrency gate ──────────────────────────────────────────────────────────
+# Caps simultaneous Docker containers across ALL paths (judge + /execute).
+# Without this 50 concurrent /run requests → 50 containers → daemon dies.
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_RUNS", "8"))
+_judge_sem = Semaphore(MAX_CONCURRENT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # pids_limit — per language
 #
 # Docker counts ALL threads (not just processes) against pids_limit.
-# "sh: 1: Cannot fork" means the limit is hit before the runtime even starts.
+# Removing `nproc` ulimit (see below) makes pids_limit the sole fork guard,
+# so these values need to be large enough for the runtime's own threads.
 #
-# Breakdown of why each value is set:
-#
-#   c / cpp / rust  — compiled binary: sh(1) + binary(1) + maybe a few
-#                     OS threads = 16 is plenty; use 32 for headroom.
-#
-#   python          — CPython spawns a handful of threads for GIL bookkeeping
-#                     and the optional GC thread; ~6 total. 32 is safe.
-#
-#   javascript      — Node.js V8 + libuv spawn ~10–14 threads (V8 isolate,
-#                     timer, I/O workers). 64 is safe.
-#
-#   java            — JVM is the worst offender: GC threads, JIT compiler
-#                     threads, reference handler, finalizer, signal dispatcher,
-#                     attach listener... easily 20–30 threads on a tiny program.
-#                     eclipse-temurin:21 peaks ~35 threads. Use 128.
-#
-# Compile stage uses the same image as execution, so compile containers
-# get the same limit. gcc/g++/rustc are single-process; javac forks the
-# JVM so it also needs the java limit.
+#   c / cpp / rust  → 16   binary only, no runtime threads
+#   python          → 32   GIL + GC threads, ~6 total
+#   javascript      → 64   V8 + libuv worker pool, ~10–14 threads
+#   java            → 128  GC + JIT + reference handler + ..., ~25–35 threads
 # ─────────────────────────────────────────────────────────────────────────────
-
 _PIDS_LIMIT: dict[str, int] = {
-    "c":          32,
-    "cpp":        32,
-    "rust":       32,
+    "c":          16,
+    "cpp":        16,
+    "rust":       16,
     "python":     32,
     "javascript": 64,
     "java":       128,
 }
-_PIDS_LIMIT_DEFAULT = 64   # fallback for any future language
-
+_PIDS_LIMIT_DEFAULT = 64
 
 def _pids_limit_for(language: str) -> int:
     return _PIDS_LIMIT.get(language, _PIDS_LIMIT_DEFAULT)
@@ -76,10 +65,10 @@ def _pids_limit_for(language: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class C:
-    RESET   = "\033[0m";  BOLD    = "\033[1m";  DIM     = "\033[2m"
-    RED     = "\033[31m"; GREEN   = "\033[32m"; YELLOW  = "\033[33m"
-    CYAN    = "\033[36m"; WHITE   = "\033[37m"; MAGENTA = "\033[35m"
-    BG_RED  = "\033[41m"; BG_GREEN = "\033[42m"; BG_YELLOW = "\033[43m"
+    RESET  = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
+    RED    = "\033[31m"; GREEN = "\033[32m"; YELLOW = "\033[33m"
+    CYAN   = "\033[36m"; WHITE = "\033[37m"; MAGENTA = "\033[35m"
+    BG_RED = "\033[41m"; BG_GREEN = "\033[42m"; BG_YELLOW = "\033[43m"
     BG_MAGENTA = "\033[45m"
     BRIGHT_RED    = "\033[91m"; BRIGHT_GREEN  = "\033[92m"
     BRIGHT_YELLOW = "\033[93m"; BRIGHT_BLUE   = "\033[94m"
@@ -111,8 +100,8 @@ def _log(level, msg):
 class Spinner:
     FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
     def __init__(self, label):
-        self.label = label
-        self._stop = threading.Event()
+        self.label  = label
+        self._stop  = threading.Event()
         self._thread = threading.Thread(target=self._spin, daemon=True)
     def _spin(self):
         for frame in itertools.cycle(self.FRAMES):
@@ -132,18 +121,18 @@ class Spinner:
 
 
 VERDICT_META = {
-    "AC":  {"label": "Accepted",             "desc": "All test cases passed.",                   "icon": "✔", "color": C.BRIGHT_GREEN,   "bg": C.BG_GREEN},
-    "WA":  {"label": "Wrong Answer",         "desc": "Output did not match expected output.",    "icon": "✖", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
-    "TLE": {"label": "Time Limit Exceeded",  "desc": "Program took longer than the limit.",      "icon": "⧖", "color": C.BRIGHT_YELLOW,  "bg": C.BG_YELLOW},
-    "RE":  {"label": "Runtime Error",        "desc": "Program crashed or exited non-zero.",      "icon": "⚡", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
-    "CE":  {"label": "Compile Error",        "desc": "Compilation failed — check your syntax.",  "icon": "⚒", "color": C.BRIGHT_YELLOW,  "bg": C.BG_YELLOW},
-    "SE":  {"label": "System Error",         "desc": "Internal judge error — please resubmit.", "icon": "⚙", "color": C.BRIGHT_MAGENTA, "bg": C.BG_MAGENTA},
-    "MLE": {"label": "Memory Limit Exceeded","desc": "Program exceeded memory limit.",           "icon": "◈", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
-    "OLE": {"label": "Output Limit Exceeded","desc": "Program produced too much output.",        "icon": "◉", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
+    "AC":  {"label": "Accepted",              "desc": "All test cases passed.",                  "icon": "✔", "color": C.BRIGHT_GREEN,   "bg": C.BG_GREEN},
+    "WA":  {"label": "Wrong Answer",          "desc": "Output did not match expected output.",   "icon": "✖", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
+    "TLE": {"label": "Time Limit Exceeded",   "desc": "Program took longer than the limit.",     "icon": "⧖", "color": C.BRIGHT_YELLOW,  "bg": C.BG_YELLOW},
+    "RE":  {"label": "Runtime Error",         "desc": "Program crashed or exited non-zero.",     "icon": "⚡", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
+    "CE":  {"label": "Compile Error",         "desc": "Compilation failed — check your syntax.", "icon": "⚒", "color": C.BRIGHT_YELLOW,  "bg": C.BG_YELLOW},
+    "SE":  {"label": "System Error",          "desc": "Internal judge error — please resubmit.","icon": "⚙", "color": C.BRIGHT_MAGENTA, "bg": C.BG_MAGENTA},
+    "MLE": {"label": "Memory Limit Exceeded", "desc": "Program exceeded memory limit.",          "icon": "◈", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
+    "OLE": {"label": "Output Limit Exceeded", "desc": "Program produced too much output.",       "icon": "◉", "color": C.BRIGHT_RED,     "bg": C.BG_RED},
 }
 
 def _verdict_banner(verdict_code):
-    meta = VERDICT_META.get(verdict_code, {"label": verdict_code, "desc": "", "icon": "?", "color": C.WHITE, "bg": ""})
+    meta  = VERDICT_META.get(verdict_code, {"label": verdict_code, "desc": "", "icon": "?", "color": C.WHITE})
     width = 64
     bar   = "━" * width
     inner = f"  {meta['icon']}  {meta['label']}"
@@ -152,7 +141,7 @@ def _verdict_banner(verdict_code):
     if meta["desc"]: print(_c(f"  {meta['desc']:<{width - 2}}", meta['color']))
     print(_c(bar, meta['color']))
 
-def _test_table(test_cases_results):
+def _test_table(rows):
     COL = [6, 10, 22, 16, 16, 9]
     HEADERS = ["Test", "Status", "Input", "Expected", "Got", "Time"]
     STATUS_STYLE = {
@@ -170,13 +159,13 @@ def _test_table(test_cases_results):
         colors = colors or [C.RESET]*len(cells)
         parts = [_c(_cell(c, w), col) for (c, w), col in zip(zip(cells, COL), colors)]
         return _c("│", C.DIM) + _c("│", C.DIM).join(parts) + _c("│", C.DIM)
-    def _row_sep(l="├", m="┼", r="┤", b="─"):
+    def _sep(l="├", m="┼", r="┤", b="─"):
         return _c(l, C.DIM) + _c(m.join(b*w for w in COL), C.DIM) + _c(r, C.DIM)
 
     print(_c("┌" + "┬".join("─"*w for w in COL) + "┐", C.DIM))
     print(_row(HEADERS, [C.BOLD]*len(HEADERS)))
-    print(_row_sep())
-    for i, t in enumerate(test_cases_results):
+    print(_sep())
+    for i, t in enumerate(rows):
         sl, sc = STATUS_STYLE.get(t["status"], (t["status"], C.WHITE))
         time_str = f"{t['time_ms']} ms" if t["time_ms"] > 0 else "—"
         tc = C.BRIGHT_YELLOW if t["time_ms"] > 1500 else C.DIM
@@ -187,7 +176,7 @@ def _test_table(test_cases_results):
         if t.get("stderr"):
             preview = t["stderr"].strip().replace("\n"," | ")[:120]
             print(_c("│", C.DIM) + _c(f"  ↳ stderr: {preview}".ljust(sum(COL)), C.BRIGHT_RED) + _c("│", C.DIM))
-        if i < len(test_cases_results)-1: print(_row_sep("├","┼","┤","─"))
+        if i < len(rows)-1: print(_sep())
     print(_c("└" + "┴".join("─"*w for w in COL) + "┘", C.DIM))
 
 def _summary_row(submission_id, language, verdict_code, passed, total, time_ms):
@@ -215,35 +204,31 @@ def get_db():
     )
 
 def setup_db():
-    conn = get_db()
-    cur  = conn.cursor()
+    conn = get_db(); cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS submissions (
-            id TEXT PRIMARY KEY,
-            language TEXT,
-            code TEXT,
-            status TEXT DEFAULT 'pending',
-            verdict TEXT,
-            stdout TEXT,
-            stderr TEXT,
-            time_ms INTEGER,
-            memory_kb INTEGER,
-            test_results JSONB,
-            problem_id INTEGER,
-            user_id INTEGER,
+            id TEXT PRIMARY KEY, language TEXT, code TEXT,
+            status TEXT DEFAULT 'pending', verdict TEXT,
+            stdout TEXT, stderr TEXT, time_ms INTEGER, memory_kb INTEGER,
+            test_results JSONB, problem_id INTEGER, user_id INTEGER,
             created_at TIMESTAMP DEFAULT NOW()
         )
     """)
     for col, typ in [("test_results", "JSONB"), ("memory_kb", "INTEGER")]:
         cur.execute(f"ALTER TABLE submissions ADD COLUMN IF NOT EXISTS {col} {typ}")
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn.commit(); cur.close(); conn.close()
     _log("ok", "Database schema verified.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Language config
+#
+# exec_cmd is now a list of strings — no shell, no sh -c, no injection surface.
+# Stdin is handled by writing input.txt and using stdin_open + socket.sendall,
+# which eliminates the extra fork that `sh -c "... < input.txt"` required.
+#
+# compile_cmd stays as a string because it's always a single compiler
+# invocation with a fixed argument list; we split it to a list at call time.
 # ─────────────────────────────────────────────────────────────────────────────
 
 LANGUAGE_CONFIG = {
@@ -251,130 +236,146 @@ LANGUAGE_CONFIG = {
         "image":       "python:3.11-slim",
         "filename":    "solution.py",
         "compile_cmd": None,
-        "exec_cmd":    "python -u /code/solution.py < /code/input.txt",
+        "exec_cmd":    ["python", "-u", "/code/solution.py"],
     },
     "javascript": {
         "image":       "node:20-slim",
         "filename":    "solution.js",
         "compile_cmd": None,
-        "exec_cmd":    "node --max-old-space-size=200 /code/solution.js < /code/input.txt",
+        "exec_cmd":    ["node", "--max-old-space-size=200", "/code/solution.js"],
     },
     "c": {
         "image":       "gcc:13",
         "filename":    "solution.c",
-        "compile_cmd": "gcc /code/solution.c -o /code/solution -O2 -lm 2>&1",
-        "exec_cmd":    "/code/solution < /code/input.txt",
+        # 2>&1 is a shell construct — we capture stderr separately in compile stage
+        "compile_cmd": ["gcc", "/code/solution.c", "-o", "/code/solution", "-O2", "-lm"],
+        "exec_cmd":    ["/code/solution"],
     },
     "cpp": {
         "image":       "gcc:13",
         "filename":    "solution.cpp",
-        "compile_cmd": "g++ /code/solution.cpp -o /code/solution -O2 -std=c++17 2>&1",
-        "exec_cmd":    "/code/solution < /code/input.txt",
+        "compile_cmd": ["g++", "/code/solution.cpp", "-o", "/code/solution", "-O2", "-std=c++17"],
+        "exec_cmd":    ["/code/solution"],
     },
     "java": {
         "image":       "eclipse-temurin:21-jdk-alpine",
         "filename":    "Main.java",
-        "compile_cmd": "javac /code/Main.java 2>&1",
-        "exec_cmd":    "java -cp /code -Xmx200m Main < /code/input.txt",
+        "compile_cmd": ["javac", "/code/Main.java"],
+        "exec_cmd":    ["java", "-cp", "/code", "-Xmx200m", "Main"],
     },
     "rust": {
         "image":       "rust:1.78-slim",
         "filename":    "solution.rs",
-        "compile_cmd": "rustc /code/solution.rs -o /code/solution --edition 2021 2>&1",
-        "exec_cmd":    "/code/solution < /code/input.txt",
+        "compile_cmd": ["rustc", "/code/solution.rs", "-o", "/code/solution", "--edition", "2021"],
+        "exec_cmd":    ["/code/solution"],
     },
 }
 
-COMPILE_TIMEOUT_S  = 30
-DEFAULT_TIMEOUT_S  = 10
+COMPILE_TIMEOUT_S = 30
+DEFAULT_TIMEOUT_S = 10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Seccomp loader — cached at module load time
+# Seccomp — loaded once at startup, reused for every container
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_security_opts_once() -> list[str]:
+def _load_security_opts() -> list[str]:
     path = os.path.abspath(SECCOMP_PROFILE_PATH)
     opts = ["no-new-privileges"]
     if not os.path.exists(path):
-        _log("warn", f"seccomp.json not found at {path} — using Docker default seccomp")
+        _log("warn", f"seccomp.json not found at {path} — using Docker default")
         return opts
     try:
-        with open(path) as f:
-            profile = f.read()
-        _log("ok", f"Seccomp profile loaded  → {path}")
-        opts.append(f"seccomp={profile}")
+        opts.append(f"seccomp={open(path).read()}")
+        _log("ok", f"Seccomp profile loaded → {path}")
     except Exception as e:
         _log("warn", f"Failed to load seccomp: {e} — using Docker default")
     return opts
 
-_SECURITY_OPTS: list[str] = _build_security_opts_once()
+_SECURITY_OPTS: list[str] = _load_security_opts()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Base ulimits
+#
+# nproc is intentionally REMOVED.
+#
+# The nproc ulimit is a per-UID kernel limit, not a per-container limit.
+# When all containers run as uid 65534 (nobody), they all share the same
+# nproc bucket. A limit of 64 means the FIRST container to spawn 64 threads
+# blocks ALL subsequent containers from forking — including containers for
+# completely different submissions. This is why you see "sh: 1: Cannot fork"
+# even on otherwise healthy runs.
+#
+# Fork protection is now provided exclusively by:
+#   - pids_limit  (per-container cgroup limit, correctly scoped)
+#   - mem_limit   (OOM kills processes before they can fork-bomb)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BASE_ULIMITS = [
+    docker.types.Ulimit(name="stack",  soft=67108864, hard=67108864),   # 64 MB stack
+    docker.types.Ulimit(name="fsize",  soft=67108864, hard=67108864),   # 64 MB max file write
+    docker.types.Ulimit(name="core",   soft=0,        hard=0),          # no core dumps
+    docker.types.Ulimit(name="nofile", soft=64,       hard=64),         # 64 open fds
+    # nproc intentionally absent — see comment above
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hardened Docker runner
+# Low-level container runner
+#
+# Key changes vs the old implementation:
+#
+#   1. exec_cmd is a list — passed directly to Docker, no sh -c wrapper.
+#      This eliminates: one fork, shell process overhead, shell injection
+#      surface, and the extra thread the shell holds open.
+#
+#   2. Stdin is fed via attach socket rather than shell redirection.
+#      The container is started with stdin_open=True, detach=True; we attach
+#      the socket, send the input bytes, close the write half, then wait for
+#      the container to exit. This is the same approach used by production
+#      judges (IOI isolate feeds stdin the same way).
+#
+#   3. Stdout is streamed in chunks with an early-exit on OLE, so a program
+#      printing infinite output doesn't buffer 10 MB before we notice.
+#
+#   4. The concurrency semaphore (_judge_sem) is acquired before container
+#      creation and released after removal, capping simultaneous containers
+#      system-wide regardless of which code path (judge / /execute) calls us.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_container_blocking(
     client,
     image:      str,
-    command:    str,
+    command:    list[str],     # ← always a list; never sh -c
     tmp_dir:    str,
+    stdin_data: bytes,         # ← raw stdin bytes; empty for compile stage
     wall_limit: int,
     label:      str,
-    language:   str,          # ← NEW: used to look up the correct pids_limit
+    language:   str,
     *,
-    capture_stderr: bool       = False,
-    extra_ulimits: list | None = None,
+    capture_stderr: bool = False,
 ) -> dict:
     """
-    Shared low-level harness used by both compile_in_docker and run_in_docker.
+    Spin up one hardened container, feed it stdin, collect stdout/stderr.
 
-    The `language` parameter is used to look up the correct pids_limit value.
-    Docker counts ALL threads (not just POSIX processes) against pids_limit,
-    so each runtime needs its own tuned ceiling:
-
-        c/cpp/rust  → 32   (sh + binary + a handful of OS threads)
-        python      → 32   (CPython GIL + GC threads, ~6 total)
-        javascript  → 64   (V8 + libuv worker pool, ~10–14 threads)
-        java        → 128  (JVM GC + JIT + reference handler + ..., ~25–35)
-
-    Using a single global value (e.g. 128) would be unnecessarily permissive
-    for C/Python and still too low for the JVM on some hosts.
+    Returns:
+        stdout   str
+        stderr   str   (non-empty only when capture_stderr=True or runtime error)
+        time_ms  int
+        error    None | "runtime_error" | "system_error"
+        tle      bool
+        ole      bool
+        oom      bool
     """
     result_holder: dict = {}
-    full_cmd = ['sh', '-c', command]
-
-    base_ulimits = [
-        docker.types.Ulimit(name="stack",  soft=67108864, hard=67108864),
-        docker.types.Ulimit(name="fsize",  soft=67108864, hard=67108864),
-        docker.types.Ulimit(name="core",   soft=0,        hard=0),
-        docker.types.Ulimit(name="nofile", soft=64,       hard=64),
-        docker.types.Ulimit(name="nproc",  soft=64,       hard=64),
-    ]
-    ulimits   = base_ulimits + (extra_ulimits or [])
-    pids_cap  = _pids_limit_for(language)
-
-    def _demux(raw: bytes) -> tuple[bytes, bytes]:
-        import struct
-        stdout_chunks, stderr_chunks = [], []
-        offset = 0
-        while offset + 8 <= len(raw):
-            stream_type, _, _, _, size = struct.unpack_from('>BxxxI', raw, offset)
-            offset += 8
-            chunk = raw[offset:offset + size]
-            offset += size
-            if stream_type == 1:
-                stdout_chunks.append(chunk)
-            elif stream_type == 2:
-                stderr_chunks.append(chunk)
-        return b"".join(stdout_chunks), b"".join(stderr_chunks)
+    pids_cap = _pids_limit_for(language)
 
     def _run():
+        container = None
         try:
-            raw: bytes = client.containers.run(
+            container = client.containers.create(
                 image=image,
-                command=full_cmd,
+                command=command,
                 volumes={tmp_dir: {"bind": "/code", "mode": "rw"}},
                 read_only=True,
                 tmpfs={"/tmp": "size=64m,mode=1777"},
@@ -383,39 +384,76 @@ def _run_container_blocking(
                 memswap_limit="256m",
                 cpu_quota=50000,
                 cpu_period=100000,
-                pids_limit=pids_cap,       # ← per-language value
+                pids_limit=pids_cap,
                 user="65534:65534",
                 cap_drop=["ALL"],
                 security_opt=_SECURITY_OPTS,
-                ulimits=ulimits,
+                ulimits=_BASE_ULIMITS,
+                stdin_open=bool(stdin_data),  # only open stdin if we have input
                 stdout=True,
                 stderr=capture_stderr,
-                remove=True,
-                detach=False,
+                detach=True,
             )
 
+            container.start()
+
+            # Feed stdin without a shell — attach to the container's stream,
+            # write input bytes, then close the write half so the program
+            # sees EOF. This replaces the old "< /code/input.txt" shell trick.
+            if stdin_data:
+                sock = container.attach_socket(params={"stdin": 1, "stream": 1})
+                try:
+                    sock._sock.sendall(stdin_data)
+                    sock._sock.shutdown(1)   # SHUT_WR → EOF to the process
+                finally:
+                    sock.close()
+
+            # Stream stdout in chunks — bail early on OLE
+            stdout_chunks: list[bytes] = []
+            total_bytes   = 0
+            ole           = False
+
+            for chunk in container.logs(stream=True, follow=True, stdout=True, stderr=False):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_OUTPUT_BYTES:
+                    ole = True
+                    break
+                stdout_chunks.append(chunk)
+
+            exit_info   = container.wait(timeout=2)
+            exit_status = exit_info.get("StatusCode", 1)
+
+            stderr_text = ""
             if capture_stderr:
-                stdout_raw, stderr_raw = _demux(raw)
-            else:
-                stdout_raw, stderr_raw = raw, b""
+                raw_err    = container.logs(stdout=False, stderr=True)
+                stderr_text = raw_err.decode("utf-8", errors="replace").strip() if raw_err else ""
 
-            ole    = len(stdout_raw) > MAX_OUTPUT_BYTES
-            stdout = stdout_raw[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace").strip()
-            stderr = stderr_raw.decode("utf-8", errors="replace").strip()
-            result_holder["result"] = {"stdout": stdout, "stderr": stderr, "exit_code": 0, "ole": ole}
-
-        except docker.errors.ContainerError as e:
-            raw_err      = e.stderr if e.stderr else b""
-            stderr_clean = raw_err.decode("utf-8", errors="replace").strip()
-            exit_status  = getattr(e, 'exit_status', 1)
-            if exit_status == 137 or stderr_clean == "Killed":
+            if ole:
                 result_holder["ole"] = True
-            else:
-                msg = stderr_clean if stderr_clean else f"exited with code {exit_status} (no output)"
+                return
+
+            stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
+
+            if exit_status == 137:
+                # SIGKILL → OOM or fsize ulimit
+                result_holder["ole"] = True
+            elif exit_status != 0:
+                msg = stderr_text if stderr_text else f"exited with code {exit_status}"
                 result_holder["runtime_error"] = msg[:65536]
+            else:
+                result_holder["result"] = {
+                    "stdout": stdout_text,
+                    "stderr": stderr_text,
+                }
 
         except Exception as exc:
             result_holder["exception"] = exc
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
 
     spinner = Spinner(label)
     spinner.start()
@@ -448,15 +486,10 @@ def _run_container_blocking(
                 "error": "runtime_error", "tle": False, "ole": False, "oom": False}
 
     r = result_holder.get("result", {})
-    if r.get("ole"):
-        spinner.stop(ok=False, final_msg=f"Output limit exceeded ({elapsed} ms)")
-        return {"stdout": "", "stderr": "Output limit exceeded (>10 MB)", "time_ms": elapsed,
-                "error": None, "tle": False, "ole": True, "oom": False}
-
     spinner.stop(ok=True, final_msg=f"{label.split('(')[0].strip()} — {elapsed} ms")
     return {
         "stdout":  r.get("stdout", ""),
-        "stderr":  "",
+        "stderr":  r.get("stderr", ""),
         "time_ms": elapsed,
         "error":   None,
         "tle":     False,
@@ -465,11 +498,33 @@ def _run_container_blocking(
     }
 
 
+def _kill_orphan_containers(client, tmp_dir: str):
+    try:
+        for c in client.containers.list():
+            mounts = str(c.attrs.get("Mounts", ""))
+            if tmp_dir in mounts or os.path.basename(tmp_dir) in mounts:
+                _log("warn", f"Killing orphan container {c.short_id}")
+                try: c.kill()
+                except Exception: pass
+                try: c.remove(force=True)
+                except Exception: pass
+    except Exception as e:
+        _log("warn", f"Kill error: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1 — Compile
+# Stage 1 — Compile (once per submission)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compile_in_docker(language: str, tmp_dir: str) -> dict:
+    """
+    Run the compiler inside a container. compile_cmd is a list — no shell.
+    Compiler output (errors) comes from stderr, which we capture directly
+    instead of the old 2>&1 shell redirect hack.
+
+    Returns {"ok": True, "compile_ms": N}
+          | {"ok": False, "verdict": "CE"|"SE", "stderr": "..."}
+    """
     cfg         = LANGUAGE_CONFIG[language]
     compile_cmd = cfg.get("compile_cmd")
 
@@ -482,11 +537,13 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
     _log("info", label)
 
     try:
-        result = _run_container_blocking(
-            client, cfg["image"], compile_cmd, tmp_dir, wall_limit, label,
-            language,                   # ← pass language for pids_limit lookup
-            capture_stderr=True,
-        )
+        with _judge_sem:
+            result = _run_container_blocking(
+                client, cfg["image"], compile_cmd, tmp_dir,
+                b"",            # compilers don't read stdin
+                wall_limit, label, language,
+                capture_stderr=True,   # compiler errors land on stderr
+            )
     except Exception as e:
         _log("error", f"Compile stage SE: {e}")
         return {"ok": False, "verdict": "SE", "stderr": str(e)}
@@ -496,7 +553,8 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
                 "stderr": f"Compilation timed out after {wall_limit}s"}
 
     if result["error"] == "runtime_error":
-        compiler_output = result["stdout"] or result["stderr"]
+        # Compiler exited non-zero — stderr holds the error text
+        compiler_output = result["stderr"] or result["stdout"]
         _log("warn", f"CE: {compiler_output[:200]}")
         return {"ok": False, "verdict": "CE", "stderr": compiler_output}
 
@@ -509,12 +567,53 @@ def compile_in_docker(language: str, tmp_dir: str) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2 — Execute one test case
+#
+# exec_cmd is a pre-built list from LANGUAGE_CONFIG — Docker passes it directly
+# to execve(), bypassing the shell entirely. stdin is sent over the attach
+# socket instead of shell redirection.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
+def run_test_in_docker(
+    language:     str,
+    tmp_dir:      str,
+    stdin_input:  str = "",
+    *,
+    time_limit_ms: int  = 0,
+    auto_cleanup:  bool = True,
+) -> dict:
+    """
+    Execute the already-compiled binary / source for one test case.
+    tmp_dir must already contain the compiled artifact from compile_in_docker.
+    Wall-clock timing covers only this container — compile time excluded.
+    """
+    cfg        = LANGUAGE_CONFIG[language]
+    client     = docker.from_env()
+    wall_limit = (time_limit_ms // 1000 + 2) if time_limit_ms else DEFAULT_TIMEOUT_S
+    label      = f"Executing {language}  (wall: {wall_limit}s)…"
+
+    try:
+        with _judge_sem:
+            return _run_container_blocking(
+                client, cfg["image"], cfg["exec_cmd"], tmp_dir,
+                stdin_input.encode(),   # fed via attach socket, not shell redirect
+                wall_limit, label, language,
+            )
+    except Exception as e:
+        _log("error", f"SYSTEM ERROR run_test  {type(e).__name__}: {e}")
+        return {"stdout": "", "stderr": str(e), "time_ms": 0,
+                "error": "system_error", "tle": False, "ole": False, "oom": False}
+    finally:
+        if auto_cleanup:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _compile_and_run_once(language: str, code: str, stdin_input: str) -> dict:
+    """
+    Compile-once-then-execute helper shared by run_in_docker and /execute.
+    Owns the tmp_dir lifecycle; always cleans up on return.
+    """
     cfg = LANGUAGE_CONFIG.get(language)
     if cfg is None:
-        _log("error", f"Unsupported language: '{language}'")
         return {"stdout": "", "stderr": f"unsupported language: '{language}'",
                 "time_ms": 0, "error": "system_error"}
 
@@ -522,15 +621,12 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
     os.chmod(tmp_dir, 0o777)
 
     try:
-        src_path   = os.path.join(tmp_dir, cfg["filename"])
-        input_path = os.path.join(tmp_dir, "input.txt")
+        src_path = os.path.join(tmp_dir, cfg["filename"])
+        with open(src_path, "w") as f:
+            f.write(code)
+        os.chmod(src_path, 0o666)
 
-        with open(src_path,   "w") as f: f.write(code)
-        with open(input_path, "w") as f: f.write(stdin_input)
-        os.chmod(src_path,   0o666)
-        os.chmod(input_path, 0o666)
-
-        _log("dim", f"Sandbox mount  → {tmp_dir}")
+        _log("dim", f"Sandbox mount → {tmp_dir}")
 
         compile_result = compile_in_docker(language, tmp_dir)
         if not compile_result["ok"]:
@@ -545,64 +641,17 @@ def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
     except Exception as e:
         _log("error", f"SYSTEM ERROR  {type(e).__name__}: {e}")
         return {"stdout": "", "stderr": str(e), "time_ms": 0, "error": "system_error"}
-
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def run_test_in_docker(
-    language:     str,
-    tmp_dir:      str,
-    stdin_input:  str = "",
-    *,
-    time_limit_ms: int  = 0,
-    auto_cleanup: bool  = True,
-) -> dict:
-    cfg        = LANGUAGE_CONFIG[language]
-    client     = docker.from_env()
-    exec_cmd   = cfg["exec_cmd"]
-    wall_limit = (time_limit_ms // 1000 + 2) if time_limit_ms else DEFAULT_TIMEOUT_S
-
-    try:
-        input_path = os.path.join(tmp_dir, "input.txt")
-        with open(input_path, "w") as f:
-            f.write(stdin_input)
-        os.chmod(input_path, 0o666)
-
-        label  = f"Executing {language}  (wall: {wall_limit}s)…"
-        result = _run_container_blocking(
-            client, cfg["image"], exec_cmd, tmp_dir, wall_limit, label,
-            language,                   # ← pass language for pids_limit lookup
-        )
-        return result
-
-    except Exception as e:
-        _log("error", f"SYSTEM ERROR run_test  {type(e).__name__}: {e}")
-        return {"stdout": "", "stderr": str(e), "time_ms": 0,
-                "error": "system_error", "tle": False, "ole": False, "oom": False}
-
-    finally:
-        if auto_cleanup:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def _kill_orphan_containers(client, tmp_dir: str):
-    try:
-        for c in client.containers.list():
-            mounts = str(c.attrs.get("Mounts", ""))
-            if tmp_dir in mounts or os.path.basename(tmp_dir) in mounts:
-                _log("warn", f"Killing orphan container {c.short_id}")
-                c.kill()
-                try:
-                    c.remove(force=True)
-                except Exception:
-                    pass
-    except Exception as kill_err:
-        _log("warn", f"Kill error: {kill_err}")
+# Public alias kept for any external callers
+def run_in_docker(language: str, code: str, stdin_input: str = "") -> dict:
+    return _compile_and_run_once(language, code, stdin_input)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Judge
+# Judge — compile once, run all test cases in the same tmp_dir
 # ─────────────────────────────────────────────────────────────────────────────
 
 def judge(submission_id: str, language: str, code: str, test_cases: list) -> dict:
@@ -611,21 +660,17 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
     display_rows = []
     test_results = []
     passed       = 0
-    result       = {}
+    result: dict = {}
 
-    def _skip_remaining(from_idx: int, verdict_code: str):
+    def _skip_remaining(from_idx: int):
         for j in range(from_idx, len(test_cases)):
-            display_rows.append({
-                "n": j+1, "status": "skip",
-                "input": test_cases[j]["input"],
-                "expected": test_cases[j].get("expected_output",""),
-                "got": "—", "time_ms": 0,
-            })
-            test_results.append({
-                "n": j+1, "passed": False, "verdict": "skip",
-                "time_ms": 0, "actual_output": "", "stderr": "",
-                "is_sample": test_cases[j].get("is_sample", False),
-            })
+            display_rows.append({"n": j+1, "status": "skip",
+                                  "input": test_cases[j]["input"],
+                                  "expected": test_cases[j].get("expected_output",""),
+                                  "got": "—", "time_ms": 0})
+            test_results.append({"n": j+1, "passed": False, "verdict": "skip",
+                                  "time_ms": 0, "actual_output": "", "stderr": "",
+                                  "is_sample": test_cases[j].get("is_sample", False)})
 
     cfg = LANGUAGE_CONFIG.get(language)
     if cfg is None:
@@ -634,12 +679,12 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
 
     tmp_dir  = tempfile.mkdtemp()
     os.chmod(tmp_dir, 0o777)
-
     src_path = os.path.join(tmp_dir, cfg["filename"])
     with open(src_path, "w") as f:
         f.write(code)
     os.chmod(src_path, 0o666)
 
+    # ── Compile once ─────────────────────────────────────────────────────────
     compile_result = compile_in_docker(language, tmp_dir)
 
     if not compile_result["ok"]:
@@ -647,87 +692,94 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
         stderr  = compile_result["stderr"]
         shutil.rmtree(tmp_dir, ignore_errors=True)
         for j, tc in enumerate(test_cases):
-            test_results.append({
-                "n": j+1, "passed": False, "verdict": verdict,
-                "time_ms": 0, "actual_output": "", "stderr": stderr,
-                "is_sample": tc.get("is_sample", False),
-            })
+            test_results.append({"n": j+1, "passed": False, "verdict": verdict,
+                                  "time_ms": 0, "actual_output": "", "stderr": stderr,
+                                  "is_sample": tc.get("is_sample", False)})
         _verdict_banner(verdict)
         _log("warn" if verdict == "CE" else "error", f"{verdict}: {stderr[:300]}")
         _summary_row(submission_id, language, verdict, 0, len(test_cases), 0)
-        return {"verdict": verdict, "stderr": stderr, "time_ms": 0,
-                "test_results": test_results}
+        return {"verdict": verdict, "stderr": stderr, "time_ms": 0, "test_results": test_results}
 
-    compile_ms = compile_result.get("compile_ms", 0)
-    _log("ok", f"Compiled in {compile_ms} ms — running {len(test_cases)} test case(s)")
+    _log("ok", f"Compiled in {compile_result.get('compile_ms', 0)} ms "
+               f"— running {len(test_cases)} test case(s)")
 
+    # ── Run each test case against the same compiled binary ──────────────────
     try:
         for i, tc in enumerate(test_cases):
             n         = i + 1
-            result    = run_test_in_docker(language, tmp_dir, tc["input"],
-                                           auto_cleanup=False)
             is_sample = tc.get("is_sample", False)
+            result    = run_test_in_docker(language, tmp_dir, tc["input"], auto_cleanup=False)
 
+            # OLE
             if result.get("ole"):
                 display_rows.append({"n": n, "status": "ole", "input": tc["input"],
-                                      "expected": tc.get("expected_output",""), "got": "[truncated]", "time_ms": result["time_ms"]})
+                                     "expected": tc.get("expected_output",""), "got": "[truncated]",
+                                     "time_ms": result["time_ms"]})
                 test_results.append({"n": n, "passed": False, "verdict": "OLE",
-                                      "time_ms": result["time_ms"], "actual_output": "", "stderr": "Output limit exceeded",
-                                      "is_sample": is_sample})
-                _skip_remaining(i+1, "OLE")
+                                     "time_ms": result["time_ms"], "actual_output": "",
+                                     "stderr": "Output limit exceeded", "is_sample": is_sample})
+                _skip_remaining(i+1)
                 _test_table(display_rows); _verdict_banner("OLE")
                 _summary_row(submission_id, language, "OLE", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "OLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
 
+            # TLE (wall-clock)
             if result.get("tle"):
                 display_rows.append({"n": n, "status": "tle", "input": tc["input"],
-                                      "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
+                                     "expected": tc.get("expected_output",""), "got": "—",
+                                     "time_ms": result["time_ms"]})
                 test_results.append({"n": n, "passed": False, "verdict": "TLE",
-                                      "time_ms": result["time_ms"], "actual_output": "", "stderr": "",
-                                      "is_sample": is_sample})
-                _skip_remaining(i+1, "TLE")
+                                     "time_ms": result["time_ms"], "actual_output": "", "stderr": "",
+                                     "is_sample": is_sample})
+                _skip_remaining(i+1)
                 _test_table(display_rows); _verdict_banner("TLE")
                 _summary_row(submission_id, language, "TLE", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "TLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
 
+            # MLE
             if result.get("oom"):
                 display_rows.append({"n": n, "status": "error", "input": tc["input"],
-                                      "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
+                                     "expected": tc.get("expected_output",""), "got": "—",
+                                     "time_ms": result["time_ms"]})
                 test_results.append({"n": n, "passed": False, "verdict": "MLE",
-                                      "time_ms": result["time_ms"], "actual_output": "",
-                                      "stderr": "Memory limit exceeded", "is_sample": is_sample})
-                _skip_remaining(i+1, "MLE")
+                                     "time_ms": result["time_ms"], "actual_output": "",
+                                     "stderr": "Memory limit exceeded", "is_sample": is_sample})
+                _skip_remaining(i+1)
                 _test_table(display_rows); _verdict_banner("MLE")
                 _summary_row(submission_id, language, "MLE", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "MLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
 
+            # SE
             if result.get("error") == "system_error":
                 _log("error", f"System error on test #{n}: {result['stderr'][:200]}")
                 _verdict_banner("SE")
                 test_results.append({"n": n, "passed": False, "verdict": "SE",
-                                      "time_ms": 0, "actual_output": "", "stderr": result.get("stderr",""),
-                                      "is_sample": is_sample})
+                                     "time_ms": 0, "actual_output": "", "stderr": result.get("stderr",""),
+                                     "is_sample": is_sample})
                 return {"verdict": "SE", "detail": result["stderr"], "test_results": test_results}
 
+            # RE
             if result.get("error") == "runtime_error":
                 display_rows.append({"n": n, "status": "error", "input": tc["input"],
-                                      "expected": tc.get("expected_output",""), "got": "—",
-                                      "time_ms": result["time_ms"], "stderr": result["stderr"]})
+                                     "expected": tc.get("expected_output",""), "got": "—",
+                                     "time_ms": result["time_ms"], "stderr": result["stderr"]})
                 test_results.append({"n": n, "passed": False, "verdict": "RE",
-                                      "time_ms": result["time_ms"], "actual_output": "",
-                                      "stderr": result.get("stderr",""), "is_sample": is_sample})
-                _skip_remaining(i+1, "RE")
+                                     "time_ms": result["time_ms"], "actual_output": "",
+                                     "stderr": result.get("stderr",""), "is_sample": is_sample})
+                _skip_remaining(i+1)
                 _test_table(display_rows); _verdict_banner("RE")
                 _summary_row(submission_id, language, "RE", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "RE", "detail": result["stderr"], "test": n, "test_results": test_results}
 
+            # Soft TLE (within wall limit but over problem time limit)
             if result["time_ms"] > 2000:
                 display_rows.append({"n": n, "status": "tle", "input": tc["input"],
-                                      "expected": tc.get("expected_output",""), "got": "—", "time_ms": result["time_ms"]})
+                                     "expected": tc.get("expected_output",""), "got": "—",
+                                     "time_ms": result["time_ms"]})
                 test_results.append({"n": n, "passed": False, "verdict": "TLE",
-                                      "time_ms": result["time_ms"], "actual_output": "", "stderr": "",
-                                      "is_sample": is_sample})
-                _skip_remaining(i+1, "TLE")
+                                     "time_ms": result["time_ms"], "actual_output": "", "stderr": "",
+                                     "is_sample": is_sample})
+                _skip_remaining(i+1)
                 _test_table(display_rows); _verdict_banner("TLE")
                 _summary_row(submission_id, language, "TLE", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "TLE", "test": n, "time_ms": result["time_ms"], "test_results": test_results}
@@ -735,24 +787,25 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
             expected = tc["expected_output"].strip()
             actual   = result["stdout"].strip()
 
+            # WA
             if actual != expected:
                 display_rows.append({"n": n, "status": "fail", "input": tc["input"],
-                                      "expected": expected, "got": actual, "time_ms": result["time_ms"]})
+                                     "expected": expected, "got": actual, "time_ms": result["time_ms"]})
                 test_results.append({"n": n, "passed": False, "verdict": "WA",
-                                      "time_ms": result["time_ms"], "actual_output": actual,
-                                      "stderr": "", "is_sample": is_sample})
-                _skip_remaining(i+1, "WA")
+                                     "time_ms": result["time_ms"], "actual_output": actual,
+                                     "stderr": "", "is_sample": is_sample})
+                _skip_remaining(i+1)
                 _test_table(display_rows); _verdict_banner("WA")
                 _summary_row(submission_id, language, "WA", passed, len(test_cases), result["time_ms"])
                 return {"verdict": "WA", "test": n, "expected": expected, "got": actual, "test_results": test_results}
 
+            # AC
             passed += 1
             display_rows.append({"n": n, "status": "pass", "input": tc["input"],
                                   "expected": expected, "got": actual, "time_ms": result["time_ms"]})
             test_results.append({"n": n, "passed": True, "verdict": "AC",
                                   "time_ms": result["time_ms"], "actual_output": actual,
                                   "stderr": "", "is_sample": is_sample})
-
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -766,31 +819,25 @@ def judge(submission_id: str, language: str, code: str, test_cases: list) -> dic
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_verdict(submission_id: str, result: dict):
-    conn = get_db()
-    cur  = conn.cursor()
+    conn = get_db(); cur = conn.cursor()
     cur.execute(
-        """
-        UPDATE submissions
-        SET verdict = %s, status = 'done', time_ms = %s, test_results = %s
-        WHERE id = %s
-        """,
-        (
-            result["verdict"],
-            result.get("time_ms", 0),
-            json.dumps(result.get("test_results", [])),
-            submission_id,
-        ),
+        "UPDATE submissions SET verdict=%s, status='done', time_ms=%s, test_results=%s WHERE id=%s",
+        (result["verdict"], result.get("time_ms", 0),
+         json.dumps(result.get("test_results", [])), submission_id),
     )
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn.commit(); cur.close(); conn.close()
     meta = VERDICT_META.get(result["verdict"], {"label": result["verdict"], "color": C.WHITE})
     _log("ok", f"Saved  {_c(submission_id, C.BOLD)}  →  {_c(meta['label'], C.BOLD, meta['color'])}")
     print(_divider())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# /execute endpoint
+# /execute endpoint  (used by the /run flow — sample cases only)
+#
+# Previously this called run_in_docker per test case, recompiling every time.
+# Now it mirrors judge(): compile once into a shared tmp_dir, then run each
+# test case against the same binary. The semaphore in run_test_in_docker
+# and compile_in_docker caps concurrency automatically.
 # ─────────────────────────────────────────────────────────────────────────────
 
 run_api = Flask(__name__)
@@ -803,42 +850,66 @@ def execute():
         code       = data["code"]
         test_cases = data.get("test_cases", [])
 
-        results    = []
-        all_passed = True
-        total_time = 0
+        cfg = LANGUAGE_CONFIG.get(language)
+        if cfg is None:
+            return jsonify({"stdout": "", "stderr": f"unsupported language: '{language}'",
+                            "time_ms": 0, "exit_code": 1}), 400
 
-        for tc in test_cases:
-            result = run_in_docker(language, code, tc["input"])
-            actual   = result["stdout"].strip()
-            expected = tc["expected_output"].strip()
+        tmp_dir = tempfile.mkdtemp()
+        os.chmod(tmp_dir, 0o777)
+        try:
+            src_path = os.path.join(tmp_dir, cfg["filename"])
+            with open(src_path, "w") as f:
+                f.write(code)
+            os.chmod(src_path, 0o666)
 
-            if result.get("ole"):
-                verdict = "OLE"
-                passed  = False
-            elif result.get("tle") or result["time_ms"] > 2000:
-                verdict = "TLE"
-                passed  = False
-            elif result["error"] == "runtime_error":
-                verdict = "RE"
-                passed  = False
-            else:
-                passed  = actual == expected
-                verdict = "AC" if passed else "WA"
+            # ── Compile once ──────────────────────────────────────────────
+            compile_result = compile_in_docker(language, tmp_dir)
+            if not compile_result["ok"]:
+                verdict = compile_result["verdict"]
+                stderr  = compile_result["stderr"]
+                return jsonify({"stdout": "", "stderr": stderr, "time_ms": 0,
+                                "exit_code": 1, "results": [], "verdict": verdict})
 
-            if not passed:
-                all_passed = False
+            # ── Run each test case against the compiled binary ────────────
+            results    = []
+            all_passed = True
+            total_time = 0
 
-            total_time += result["time_ms"]
-            results.append({
-                "passed":          passed,
-                "verdict":         verdict,
-                "time_ms":         result["time_ms"],
-                "actual_output":   actual,
-                "expected_output": expected,
-                "input":           tc["input"],
-                "stderr":          result.get("stderr", ""),
-                "is_sample":       tc.get("is_sample", False),
-            })
+            for tc in test_cases:
+                result   = run_test_in_docker(language, tmp_dir, tc["input"], auto_cleanup=False)
+                actual   = result["stdout"].strip()
+                expected = tc["expected_output"].strip()
+
+                if result.get("ole"):
+                    verdict = "OLE"; passed = False
+                elif result.get("tle") or result["time_ms"] > 2000:
+                    verdict = "TLE"; passed = False
+                elif result.get("error") == "runtime_error":
+                    verdict = "RE"; passed = False
+                elif result.get("error"):
+                    verdict = "SE"; passed = False
+                else:
+                    passed  = actual == expected
+                    verdict = "AC" if passed else "WA"
+
+                if not passed:
+                    all_passed = False
+
+                total_time += result["time_ms"]
+                results.append({
+                    "passed":          passed,
+                    "verdict":         verdict,
+                    "time_ms":         result["time_ms"],
+                    "actual_output":   actual,
+                    "expected_output": expected,
+                    "input":           tc["input"],
+                    "stderr":          result.get("stderr", ""),
+                    "is_sample":       tc.get("is_sample", False),
+                })
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
         first = results[0] if results else {}
         return jsonify({
@@ -847,7 +918,7 @@ def execute():
             "time_ms":   total_time,
             "exit_code": 0 if all_passed else 1,
             "results":   results,
-            "verdict":   "AC" if all_passed else (results[0]["verdict"] if results else "SE"),
+            "verdict":   "AC" if all_passed else (first.get("verdict", "SE")),
         })
 
     except Exception as e:
@@ -859,14 +930,14 @@ def execute():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def on_message(ch, method, properties, body):
-    data = json.loads(body)
+    data   = json.loads(body)
     result = judge(data["id"], data["language"], data["code"], data["test_cases"])
     save_verdict(data["id"], result)
     ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
 def start_worker():
-    _header("Judge Worker  v2.0")
+    _header("Judge Worker  v2.1")
 
     with Spinner("Connecting to PostgreSQL…") as sp:
         setup_db()
@@ -877,9 +948,11 @@ def start_worker():
         _log("ok",   f"Seccomp profile  → {seccomp_path}")
     else:
         _log("warn", f"Seccomp profile missing at {seccomp_path}")
-        _log("warn", "Containers will use Docker default seccomp — add sandbox/seccomp.json for full hardening")
+        _log("warn", "Add sandbox/seccomp.json for full hardening")
 
-    _log("info", "Connecting to RabbitMQ…")
+    _log("info", f"Concurrency cap  → {MAX_CONCURRENT} simultaneous containers")
+    _log("info",  "Connecting to RabbitMQ…")
+
     connection = pika.BlockingConnection(
         pika.ConnectionParameters(
             host=os.environ["RABBITMQ_HOST"],
@@ -908,3 +981,5 @@ def start_worker():
 
 if __name__ == "__main__":
     start_worker()
+ENDOFFILE
+echo "wrote $(wc -l < /home/claude/judge.py) lines"
