@@ -1,43 +1,19 @@
-import subprocess
-import time
-import threading
-import itertools
-import hashlib
+# pip install rich watchdog gitpython
+
 import os
-import sys
-from datetime import datetime
+import time
+import hashlib
+import subprocess
 from collections import deque
 
-# ═════════════════════════════════════════════════════════════
-# COLORS
-# ═════════════════════════════════════════════════════════════
-
-class C:
-    RESET = "\033[0m"
-
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-
-    RED = "\033[31m"
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    MAGENTA = "\033[35m"
-    CYAN = "\033[36m"
-    WHITE = "\033[37m"
-
-    BRIGHT_RED = "\033[91m"
-    BRIGHT_GREEN = "\033[92m"
-    BRIGHT_YELLOW = "\033[93m"
-    BRIGHT_BLUE = "\033[94m"
-    BRIGHT_MAGENTA = "\033[95m"
-    BRIGHT_CYAN = "\033[96m"
-    BRIGHT_WHITE = "\033[97m"
-
-
-def c(text, *codes):
-    return "".join(codes) + str(text) + C.RESET
-
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.live import Live
+from rich.align import Align
+from rich.text import Text
+from rich.columns import Columns
 
 # ═════════════════════════════════════════════════════════════
 # CONFIG
@@ -55,43 +31,26 @@ IGNORE = {
     "venv"
 }
 
-last_hashes = {}
-recent_logs = deque(maxlen=8)
-recent_commits = deque(maxlen=6)
-changed_files_live = deque(maxlen=10)
+# ═════════════════════════════════════════════════════════════
+# STATE
+# ═════════════════════════════════════════════════════════════
 
-pending_push = False
-last_push = time.time()
+console = Console()
+
+recent_logs = deque(maxlen=10)
+recent_commits = deque(maxlen=8)
+changed_files = deque(maxlen=10)
+
+last_hashes = {}
+
 push_count = 0
 commit_count = 0
 
-spinner_index = 0
-
-SPINNER = [
-    "⠋","⠙","⠹","⠸","⠼",
-    "⠴","⠦","⠧","⠇","⠏"
-]
+pending_push = False
+last_push = time.time()
 
 # ═════════════════════════════════════════════════════════════
-# TERMINAL
-# ═════════════════════════════════════════════════════════════
-
-def clear():
-    os.system("cls" if os.name == "nt" else "clear")
-
-
-def ts():
-    return datetime.now().strftime("%H:%M:%S")
-
-
-def log(msg, color=C.BRIGHT_WHITE):
-    recent_logs.appendleft(
-        f"{c(ts(), C.DIM)} {c(msg, color)}"
-    )
-
-
-# ═════════════════════════════════════════════════════════════
-# GIT
+# HELPERS
 # ═════════════════════════════════════════════════════════════
 
 def run(cmd):
@@ -111,6 +70,12 @@ def silent(cmd):
     )
 
 
+def log(msg, style="cyan"):
+    recent_logs.appendleft(
+        f"[dim]{time.strftime('%H:%M:%S')}[/dim] [{style}]{msg}[/{style}]"
+    )
+
+
 def get_branch():
     try:
         return run("git branch --show-current")
@@ -118,7 +83,7 @@ def get_branch():
         return "unknown"
 
 
-def get_changed_files():
+def get_changed():
     try:
         output = run("git status --porcelain")
     except:
@@ -135,13 +100,6 @@ def get_changed_files():
     return files
 
 
-def get_diff(file):
-    try:
-        return run(f'git diff "{file}"')
-    except:
-        return ""
-
-
 def get_hash(file):
     try:
         with open(file, "rb") as f:
@@ -150,15 +108,19 @@ def get_hash(file):
         return None
 
 
+def get_diff(file):
+    try:
+        return run(f'git diff "{file}"')
+    except:
+        return ""
+
+
 # ═════════════════════════════════════════════════════════════
-# SMART COMMIT MSGS
+# SMART COMMIT MESSAGE
 # ═════════════════════════════════════════════════════════════
 
 def generate_commit_message(file, diff):
     lower = file.lower()
-
-    additions = diff.count("\n+")
-    deletions = diff.count("\n-")
 
     if "judge" in lower:
         return "feat(judge): improve execution engine"
@@ -173,10 +135,7 @@ def generate_commit_message(file, diff):
         return "ui(verdict): improve verdict display"
 
     if lower.endswith(".jsx"):
-        if additions > deletions:
-            return f"ui: enhance {os.path.basename(file)}"
-
-        return f"ui: refine {os.path.basename(file)}"
+        return f"ui: update {os.path.basename(file)}"
 
     if lower.endswith(".py"):
         return f"backend: improve {os.path.basename(file)}"
@@ -191,7 +150,7 @@ def generate_commit_message(file, diff):
 
 
 # ═════════════════════════════════════════════════════════════
-# COMMIT
+# COMMIT LOGIC
 # ═════════════════════════════════════════════════════════════
 
 def commit_file(file):
@@ -208,27 +167,25 @@ def commit_file(file):
     if not diff.strip():
         return
 
-    commit_msg = generate_commit_message(file, diff)
+    msg = generate_commit_message(file, diff)
 
     silent(f'git add "{file}"')
 
     commit = silent(
-        f'git commit -m "{commit_msg}" "{file}"'
+        f'git commit -m "{msg}" "{file}"'
     )
 
     if commit.returncode == 0:
 
         commit_count += 1
 
-        recent_commits.appendleft({
-            "msg": commit_msg,
-            "file": file,
-            "time": ts()
-        })
+        recent_commits.appendleft(
+            f"[green]{msg}[/green]"
+        )
 
         log(
             f"Committed {os.path.basename(file)}",
-            C.BRIGHT_GREEN
+            "green"
         )
 
         last_hashes[file] = current_hash
@@ -237,7 +194,7 @@ def commit_file(file):
 
 
 # ═════════════════════════════════════════════════════════════
-# PUSH
+# PUSH LOGIC
 # ═════════════════════════════════════════════════════════════
 
 def push_changes():
@@ -251,226 +208,266 @@ def push_changes():
 
         push_count += 1
 
-        log(
-            "Changes synced to GitHub",
-            C.BRIGHT_CYAN
-        )
-
         pending_push = False
         last_push = time.time()
 
+        log(
+            "Changes pushed to GitHub",
+            "bright_cyan"
+        )
+
     else:
+
         log(
             "Push failed",
-            C.BRIGHT_RED
+            "red"
         )
 
 
 # ═════════════════════════════════════════════════════════════
-# UI TABLES
+# UI COMPONENTS
 # ═════════════════════════════════════════════════════════════
 
-def line(width=96):
-    return c("━" * width, C.DIM)
+def make_status():
+    table = Table.grid(expand=True)
 
+    table.add_column(justify="left")
+    table.add_column(justify="right")
 
-def table(title, rows, color=C.BRIGHT_CYAN):
-    width = 96
-
-    print(c(f"┏{'━' * (width - 2)}┓", C.DIM))
-
-    print(
-        c("┃ ", C.DIM) +
-        c(title.ljust(width - 4), C.BOLD, color) +
-        c(" ┃", C.DIM)
+    queue = (
+        "[yellow]PENDING[/yellow]"
+        if pending_push else
+        "[green]IDLE[/green]"
     )
 
-    print(c(f"┣{'━' * (width - 2)}┫", C.DIM))
+    table.add_row(
+        "[bold magenta]Repository[/bold magenta]",
+        os.getcwd()
+    )
 
-    for row in rows:
-        row = row[:width - 6]
+    table.add_row(
+        "[bold magenta]Branch[/bold magenta]",
+        f"[green]{get_branch()}[/green]"
+    )
 
-        print(
-            c("┃ ", C.DIM) +
-            row.ljust(width - 4) +
-            c(" ┃", C.DIM)
+    table.add_row(
+        "[bold magenta]Commits[/bold magenta]",
+        f"[cyan]{commit_count}[/cyan]"
+    )
+
+    table.add_row(
+        "[bold magenta]Pushes[/bold magenta]",
+        f"[cyan]{push_count}[/cyan]"
+    )
+
+    table.add_row(
+        "[bold magenta]Queue[/bold magenta]",
+        queue
+    )
+
+    table.add_row(
+        "[bold magenta]Last Push[/bold magenta]",
+        time.strftime(
+            "%H:%M:%S",
+            time.localtime(last_push)
+        )
+    )
+
+    return Panel(
+        table,
+        title="[bold bright_cyan]SYSTEM STATUS[/bold bright_cyan]",
+        border_style="bright_blue"
+    )
+
+
+def make_files():
+    table = Table(expand=True)
+
+    table.add_column("Status", style="yellow")
+    table.add_column("File", style="white")
+
+    if changed_files:
+        for file in list(changed_files)[:8]:
+            table.add_row(
+                "MODIFIED",
+                file
+            )
+    else:
+        table.add_row(
+            "IDLE",
+            "No changed files"
         )
 
-    print(c(f"┗{'━' * (width - 2)}┛", C.DIM))
+    return Panel(
+        table,
+        title="[bold yellow]LIVE FILE WATCHER[/bold yellow]",
+        border_style="yellow"
+    )
+
+
+def make_commits():
+    table = Table(expand=True)
+
+    table.add_column("Recent Commits", style="green")
+
+    if recent_commits:
+        for commit in recent_commits:
+            table.add_row(commit)
+    else:
+        table.add_row("[dim]No commits yet[/dim]")
+
+    return Panel(
+        table,
+        title="[bold green]RECENT COMMITS[/bold green]",
+        border_style="green"
+    )
+
+
+def make_logs():
+    table = Table(expand=True)
+
+    table.add_column("Logs", style="cyan")
+
+    if recent_logs:
+        for row in recent_logs:
+            table.add_row(row)
+    else:
+        table.add_row("[dim]Waiting for activity[/dim]")
+
+    return Panel(
+        table,
+        title="[bold magenta]LIVE EVENT LOGS[/bold magenta]",
+        border_style="magenta"
+    )
 
 
 # ═════════════════════════════════════════════════════════════
-# RENDER
+# MAIN LAYOUT
 # ═════════════════════════════════════════════════════════════
 
-def render():
-    global spinner_index
+def build_layout():
 
-    clear()
+    layout = Layout()
 
-    spinner = SPINNER[spinner_index % len(SPINNER)]
-    spinner_index += 1
-
-    print()
-
-    print(
-        c("   SIMUX ", C.BOLD, C.BRIGHT_MAGENTA) +
-        c("SMART GIT DAEMON", C.BOLD, C.BRIGHT_CYAN) +
-        c(f"   {spinner}", C.BRIGHT_GREEN)
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="main"),
+        Layout(name="footer", size=3)
     )
 
-    print(line())
-
-    # STATUS TABLE
-
-    rows = [
-        f"{c('Repository', C.BRIGHT_MAGENTA)}  →  {c(os.getcwd(), C.BRIGHT_WHITE)}",
-        f"{c('Branch', C.BRIGHT_MAGENTA)}      →  {c(get_branch(), C.BRIGHT_GREEN)}",
-        f"{c('Commits', C.BRIGHT_MAGENTA)}     →  {c(commit_count, C.BRIGHT_CYAN)}",
-        f"{c('Pushes', C.BRIGHT_MAGENTA)}      →  {c(push_count, C.BRIGHT_CYAN)}",
-        f"{c('Queue', C.BRIGHT_MAGENTA)}       →  {c('PENDING PUSH', C.BRIGHT_YELLOW) if pending_push else c('IDLE', C.BRIGHT_GREEN)}",
-        f"{c('Last Push', C.BRIGHT_MAGENTA)}   →  {c(datetime.fromtimestamp(last_push).strftime('%H:%M:%S'), C.BRIGHT_WHITE)}"
-    ]
-
-    table("SYSTEM STATUS", rows)
-
-    # CHANGED FILES
-
-    changed_rows = []
-
-    for file in list(changed_files_live)[:8]:
-        changed_rows.append(
-            f"{c('MODIFIED', C.BRIGHT_YELLOW)}  →  {c(file, C.BRIGHT_WHITE)}"
-        )
-
-    if not changed_rows:
-        changed_rows.append(
-            c("No active file changes", C.DIM)
-        )
-
-    table(
-        "LIVE FILE WATCHER",
-        changed_rows,
-        C.BRIGHT_YELLOW
+    layout["main"].split_row(
+        Layout(name="left"),
+        Layout(name="right")
     )
 
-    # COMMITS
-
-    commit_rows = []
-
-    for commit in recent_commits:
-
-        commit_rows.append(
-            f"{c(commit['time'], C.DIM)}  {c(commit['msg'], C.BRIGHT_GREEN)}"
-        )
-
-    if not commit_rows:
-        commit_rows.append(
-            c("No commits yet", C.DIM)
-        )
-
-    table(
-        "RECENT COMMITS",
-        commit_rows,
-        C.BRIGHT_GREEN
+    layout["left"].split_column(
+        Layout(name="status"),
+        Layout(name="files")
     )
 
-    # LOGS
+    layout["right"].split_column(
+        Layout(name="commits"),
+        Layout(name="logs")
+    )
 
-    log_rows = list(recent_logs)
+    # HEADER
 
-    if not log_rows:
-        log_rows.append(
-            c("Daemon initialized", C.BRIGHT_CYAN)
+    layout["header"].update(
+        Panel(
+            Align.center(
+                Text(
+                    "SIMUX SMART GIT DAEMON",
+                    style="bold bright_magenta"
+                )
+            ),
+            border_style="bright_cyan"
         )
-
-    table(
-        "LIVE EVENT LOGS",
-        log_rows,
-        C.BRIGHT_MAGENTA
     )
 
-    print()
-    print(
-        c(
-            " CTRL + C ",
-            C.BOLD,
-            C.BRIGHT_RED
-        ) +
-        c("to stop daemon", C.DIM)
+    # PANELS
+
+    layout["status"].update(make_status())
+    layout["files"].update(make_files())
+
+    layout["commits"].update(make_commits())
+    layout["logs"].update(make_logs())
+
+    # FOOTER
+
+    footer = Text()
+
+    footer.append(
+        " CTRL + C ",
+        style="bold white on red"
     )
 
-    print()
+    footer.append(
+        " to stop daemon",
+        style="dim"
+    )
+
+    layout["footer"].update(
+        Panel(
+            Align.center(footer),
+            border_style="bright_black"
+        )
+    )
+
+    return layout
 
 
 # ═════════════════════════════════════════════════════════════
 # STARTUP
 # ═════════════════════════════════════════════════════════════
 
-log(
-    "Git daemon initialized",
-    C.BRIGHT_CYAN
-)
-
-log(
-    f"Watching {os.getcwd()}",
-    C.BRIGHT_GREEN
-)
+log("Smart daemon initialized", "bright_cyan")
+log(f"Watching {os.getcwd()}", "green")
 
 # ═════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ═════════════════════════════════════════════════════════════
 
-while True:
+with Live(
+    build_layout(),
+    refresh_per_second=10,
+    screen=True
+) as live:
 
-    try:
+    while True:
 
-        changed = get_changed_files()
+        try:
 
-        changed_files_live.clear()
+            changed = get_changed()
 
-        for file in changed:
-            changed_files_live.appendleft(file)
+            changed_files.clear()
 
-        for file in changed:
-            commit_file(file)
+            for file in changed:
+                changed_files.appendleft(file)
 
-        if pending_push:
+            for file in changed:
+                commit_file(file)
 
-            now = time.time()
+            if pending_push:
 
-            if now - last_push >= PUSH_INTERVAL:
-                push_changes()
+                now = time.time()
 
-        render()
+                if now - last_push >= PUSH_INTERVAL:
+                    push_changes()
 
-        time.sleep(1)
+            live.update(build_layout())
 
-    except KeyboardInterrupt:
+            time.sleep(1)
 
-        clear()
+        except KeyboardInterrupt:
+            break
 
-        print()
+        except Exception as e:
 
-        print(
-            c(
-                " SMART PUSHER STOPPED ",
-                C.BOLD,
-                C.BRIGHT_RED
+            log(
+                f"{type(e).__name__}: {e}",
+                "red"
             )
-        )
 
-        print()
+            live.update(build_layout())
 
-        break
-
-    except Exception as e:
-
-        log(
-            f"{type(e).__name__}: {e}",
-            C.BRIGHT_RED
-        )
-
-        render()
-
-        time.sleep(2)
+            time.sleep(2)
