@@ -397,13 +397,6 @@ def _run_container_blocking(
             # Feed stdin without a shell — attach to the container's stream,
             # write input bytes, then close the write half so the program
             # sees EOF. This replaces the old "< /code/input.txt" shell trick.
-            if stdin_data:
-                sock = container.attach_socket(params={"stdin": 1, "stream": 1})
-                try:
-                    sock._sock.sendall(stdin_data)
-                    sock._sock.shutdown(1)   # SHUT_WR → EOF to the process
-                finally:
-                    sock.close()
 
             # Stream stdout in chunks — bail early on OLE
             stdout_chunks: list[bytes] = []
